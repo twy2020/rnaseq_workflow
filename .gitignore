@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local config and secrets
+config.yaml
+config.local.yaml
+*.local.yaml
+*.local.yml
+*.env
+!.env.example
+docker/proxy.env
+!docker/proxy.env.example
+
+# Runtime workspaces, logs, reports, and temporary outputs
+workspace/
+runtime_logs/
+dev_logs/
+logs/
+output/
+outputs/
+reports/
+tmp/
+temp/
+
+# Downloaded sequencing data and workflow intermediates
+*.sra
+*.sralite
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
+*.sam
+*.bam
+*.bai
+*.cram
+*.crai
+*.vcf
+*.vcf.gz
+*.tmp
+*.prf
+*.lock
+.locks/
+.done.json
+.error.txt
+*.vdb_validate.json
+
+# Bioinformatics indexes and large reference assets
+*.ht2
+*.ht2l
+*.bt2
+*.bt2l
+*.fai
+*.gzi
+*.dict
+*.2bit
+*.fa
+*.fasta
+*.fna
+*.gtf
+*.gff
+*.gff3
+
+# Keep lightweight reference metadata only
+references/**
+!references/**/
+!references/**/reference.json
+!references/**/README.md
+
+# Local datasets
+data/
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Notebooks
+.ipynb_checkpoints/

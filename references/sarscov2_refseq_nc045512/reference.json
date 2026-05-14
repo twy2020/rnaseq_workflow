@@ -1,0 +1,24 @@
+{
+  "reference_id": "sarscov2_refseq_nc045512",
+  "root": "references\\sarscov2_refseq_nc045512",
+  "fasta": "references\\sarscov2_refseq_nc045512\\genome.fna",
+  "annotation": "references\\sarscov2_refseq_nc045512\\annotation.gff",
+  "hisat2_index": "references\\sarscov2_refseq_nc045512\\hisat2\\genome",
+  "created_at": "2026-05-12T15:40:23",
+  "updated_at": "2026-05-12T15:40:24",
+  "provider": "refseq",
+  "annotation_provider": "refseq",
+  "species": null,
+  "assembly": null,
+  "release": null,
+  "taxon_id": null,
+  "source_urls": [
+    "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/858/895/GCF_009858895.2_ASM985889v3/GCF_009858895.2_ASM985889v3_genomic.fna.gz",
+    "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/858/895/GCF_009858895.2_ASM985889v3/GCF_009858895.2_ASM985889v3_genomic.gff.gz"
+  ],
+  "annotation_format": "gff",
+  "created_by": "download",
+  "build_status": "completed",
+  "warnings": [],
+  "notes": "Downloaded from https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/858/895/GCF_009858895.2_ASM985889v3/GCF_009858895.2_ASM985889v3_genomic.fna.gz and https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/858/895/GCF_009858895.2_ASM985889v3/GCF_009858895.2_ASM985889v3_genomic.gff.gz"
+}

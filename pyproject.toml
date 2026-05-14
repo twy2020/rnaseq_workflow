@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rnaseq-workflow"
+version = "0.1.0"
+description = "A modular RNA-seq workflow CLI and core engine."
+requires-python = ">=3.10"
+dependencies = [
+  "pyyaml>=6.0",
+  "typer>=0.12",
+  "rich>=13.0",
+  "prompt_toolkit>=3.0",
+  "pytest>=8.0",
+  "filelock>=3.13",
+  "psutil>=5.9",
+]
+
+[project.scripts]
+rnaseq = "rnaseq_workflow.cli.main:app"
+
+[tool.setuptools]
+package-dir = {"" = "workflow"}
+
+[tool.setuptools.packages.find]
+where = ["workflow"]

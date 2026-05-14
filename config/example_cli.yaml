@@ -1,0 +1,20 @@
+project_id: demo_project
+work_dir: .
+output_dir: runtime_logs/demo_project
+
+samples:
+  - sample_id: SRR_DEMO_1
+    source_path: data/SRR_DEMO_1.sra
+    layout: paired
+  - sample_id: SRR_DEMO_2
+    source_path: data/SRR_DEMO_2.sra
+    layout: paired
+
+steps:
+  - download
+  - data_ingestion
+  - quality_control
+  - read_trimming
+  - alignment
+  - quantification
+  - reporting

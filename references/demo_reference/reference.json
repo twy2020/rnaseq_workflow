@@ -1,0 +1,10 @@
+{
+  "reference_id": "demo_reference",
+  "root": "references\\demo_reference",
+  "fasta": "references\\demo_reference\\genome.fa",
+  "annotation": "references\\demo_reference\\annotation.gtf",
+  "hisat2_index": "references\\demo_reference\\hisat2\\genome",
+  "created_at": "2026-05-10T17:43:16",
+  "updated_at": "2026-05-10T17:43:41",
+  "notes": ""
+}

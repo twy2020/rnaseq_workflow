@@ -1,0 +1,9 @@
+{
+  "accessions": [
+    {
+      "accession": "SRR11047173",
+      "source": "sra",
+      "expected_size_bytes": 2078277632
+    }
+  ]
+}
