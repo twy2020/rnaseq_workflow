@@ -31,6 +31,7 @@ RUN apt-get update \
       hisat2 \
       samtools \
       subread \
+      stringtie \
       gzip \
       unzip \
       default-jre-headless \

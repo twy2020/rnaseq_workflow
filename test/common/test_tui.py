@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from rnaseq_workflow.cli.tui import _is_interactive_terminal
 
 
@@ -422,6 +424,74 @@ def test_task_artifact_targets_and_cleanup(tmp_path):
     assert task.samples_dir.exists()
     assert not any(task.downloads_dir.rglob("*.*"))
     assert (task.reports_dir / "report.json").exists()
+
+
+def test_task_artifact_targets_include_registered_external_outputs(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    external_root = tmp_path / "spill" / "users" / task.user_id / "tasks" / task.task_id
+    external_samples = external_root / "samples"
+    (external_samples / "S1" / "alignment").mkdir(parents=True)
+    (external_samples / "S1" / "alignment" / "S1.bam").write_text("bam-data", encoding="utf-8")
+    tui._record_output_root(task, task.task_output_dir, external_root, reason="large_outputs_root")
+
+    targets = tui._task_artifact_targets(task)
+    external_target = next(target for target in targets if target.external and target.path == external_samples)
+
+    assert external_target.files == 1
+    assert external_target.size_bytes == 8
+
+    removed = tui._remove_task_artifacts(task, [external_target])
+
+    assert removed == 8
+    assert external_samples.exists()
+    assert not any(external_samples.rglob("*.*"))
+
+
+def test_task_artifact_stats_compacts_long_paths(capsys, tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    (task.reports_dir / "report.json").write_text("{}", encoding="utf-8")
+
+    tui._print_task_artifact_stats(Console(force_terminal=False), task, tui._task_artifact_targets(task))
+    text = capsys.readouterr().out
+
+    assert "工作目录" in text
+    assert "末级目录" in text
+    assert "D1" in text
+
+
+def test_task_artifact_cleanup_rejects_unregistered_external_path(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    outside = tmp_path / "outside" / "file.txt"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("do not delete", encoding="utf-8")
+    target = tui._ArtifactTarget("outside", "外部路径", outside, 1, outside.stat().st_size, "not registered", external=True)
+
+    with pytest.raises(ValueError, match="outside task dir"):
+        tui._remove_task_artifacts(task, [target])
+
+    assert outside.exists()
+
+
+def test_compact_paths_in_text_uses_work_dir_registry(tmp_path):
+    from rnaseq_workflow.cli import tui
+
+    registry = tui._PathDisplayRegistry()
+    path = tmp_path / "very" / "long" / "samples" / "S1" / "alignment" / "S1.sam"
+    text = tui._compact_paths_in_text(f"SAM file not found: {path}", registry)
+
+    assert "SAM file not found: D1/S1.sam" in text
+    assert "very" in registry.text()
 
 
 def test_workflow_resource_check_writes_metadata(monkeypatch, tmp_path):
@@ -1427,15 +1497,208 @@ def test_update_manifest_expected_sizes_persists_sizes(tmp_path):
 
 def test_enrich_manifest_expected_sizes_uses_runinfo(monkeypatch):
     from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.steps.download.runinfo import SraRunMetadata
 
     monkeypatch.setattr(
-        "rnaseq_workflow.steps.download.fetch_sra_runinfo_rows",
-        lambda accessions, timeout_seconds=8.0: [{"Run": "SRR1", "size_MB": "2"}],
+        tui,
+        "fetch_sra_metadata",
+        lambda accessions, timeout_seconds=8.0: [
+            SraRunMetadata(run="SRR1", size_mb="2", scientific_name="Arabidopsis thaliana", taxid="3702")
+        ],
     )
     data = {"accessions": ["SRR1"], "metadata": []}
 
     assert tui._enrich_manifest_expected_sizes(data)
     assert data["metadata"][0]["expected_size_bytes"] == 2 * 1024 * 1024
+    assert data["metadata"][0]["scientific_name"] == "Arabidopsis thaliana"
+    assert data["metadata"][0]["taxid"] == "3702"
+
+
+def test_species_check_detects_reference_mismatch(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.references import ReferenceAsset
+
+    workspace = AssetWorkspace(tmp_path / "workspace")
+    task = workspace.ensure_user("user-1").create_task()
+    (task.metadata_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "accessions": ["SRR1"],
+                "metadata": [{"run": "SRR1", "scientific_name": "Arabidopsis thaliana", "taxid": "3702"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    asset = ReferenceAsset(
+        reference_id="glycine_max",
+        root=tmp_path / "ref",
+        fasta=tmp_path / "ref" / "genome.fa",
+        annotation=tmp_path / "ref" / "genes.gtf",
+        hisat2_index=tmp_path / "ref" / "hisat2" / "genome",
+        created_at="",
+        updated_at="",
+        species="glycine_max",
+        taxon_id="3847",
+    )
+
+    report = tui._check_manifest_species_against_reference(task, asset)
+
+    assert not report.ok
+    assert report.mismatches[0].sample_id == "SRR1"
+    assert report.mismatches[0].message == "TaxID mismatch"
+
+
+def test_species_check_matches_normalized_species_without_taxid(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.references import ReferenceAsset
+
+    workspace = AssetWorkspace(tmp_path / "workspace")
+    task = workspace.ensure_user("user-1").create_task()
+    (task.metadata_dir / "manifest.json").write_text(
+        json.dumps({"local_files": [{"path": str(tmp_path / "S1.fastq.gz"), "sample_id": "S1", "species": "Arabidopsis thaliana"}]}),
+        encoding="utf-8",
+    )
+    asset = ReferenceAsset(
+        reference_id="arabidopsis",
+        root=tmp_path / "ref",
+        fasta=tmp_path / "ref" / "genome.fa",
+        annotation=None,
+        hisat2_index=tmp_path / "ref" / "hisat2" / "genome",
+        created_at="",
+        updated_at="",
+        species="arabidopsis_thaliana",
+    )
+
+    report = tui._check_manifest_species_against_reference(task, asset)
+
+    assert report.ok
+    assert report.rows[0].status == "match"
+
+
+def test_auto_update_task_sample_metadata_writes_old_manifest_runinfo(monkeypatch, tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.steps.download.runinfo import SraRunMetadata
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    (task.metadata_dir / "manifest.json").write_text(json.dumps({"accessions": ["SRR1"], "metadata": []}), encoding="utf-8")
+    monkeypatch.setattr(
+        tui,
+        "fetch_sra_metadata",
+        lambda accessions, timeout_seconds=20.0: [
+            SraRunMetadata(run="SRR1", scientific_name="Arabidopsis thaliana", taxid="3702", bioproject="PRJ1", size_mb="1")
+        ],
+    )
+
+    updated, message = tui._auto_update_task_sample_metadata(task)
+
+    data = json.loads((task.metadata_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert updated
+    assert "已更新 1 条" in message
+    assert data["metadata"][0]["scientific_name"] == "Arabidopsis thaliana"
+    assert data["metadata"][0]["taxid"] == "3702"
+    assert data["metadata"][0]["expected_size_bytes"] == 1024 * 1024
+
+
+def test_manual_sample_metadata_form_updates_local_manifest(tmp_path):
+    from rnaseq_workflow.cli import tui
+
+    manifest = {"local_files": [{"path": str(tmp_path / "S1.fastq.gz"), "sample_id": "S1", "input_type": "fastq"}]}
+    row = tui._find_or_create_manifest_sample_metadata(manifest, "local:0")
+
+    tui._apply_sample_metadata_form(
+        row,
+        {
+            "sample_id": "S1",
+            "scientific_name": "Arabidopsis thaliana",
+            "taxid": "3702",
+            "bioproject": "PRJ1",
+            "biosample": "",
+            "library_layout": "PAIRED",
+            "library_source": "TRANSCRIPTOMIC",
+            "library_strategy": "RNA-Seq",
+        },
+    )
+
+    assert manifest["local_files"][0]["scientific_name"] == "Arabidopsis thaliana"
+    assert manifest["local_files"][0]["species"] == "Arabidopsis thaliana"
+    assert manifest["local_files"][0]["taxid"] == "3702"
+    assert manifest["local_files"][0]["taxon_id"] == "3702"
+    assert manifest["local_files"][0]["library_layout"] == "PAIRED"
+
+
+def test_species_check_report_prints_reference_paths(tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.references import ReferenceAsset
+
+    console = Console(record=True, width=180)
+    asset = ReferenceAsset(
+        reference_id="arabidopsis",
+        root=tmp_path / "ref",
+        fasta=tmp_path / "ref" / "genome.fa",
+        annotation=tmp_path / "ref" / "genes.gtf",
+        hisat2_index=tmp_path / "ref" / "hisat2" / "genome",
+        created_at="",
+        updated_at="",
+        species="Arabidopsis thaliana",
+        taxon_id="3702",
+        assembly="TAIR10",
+        release="60",
+    )
+    report = tui._SpeciesCheckReport(
+        [
+            tui._SpeciesCheckRow(
+                sample_id="SRR1",
+                sample_species="Arabidopsis thaliana",
+                sample_taxid="3702",
+                reference_species="Arabidopsis thaliana",
+                reference_taxid="3702",
+                status="match",
+                message="TaxID match",
+            )
+        ]
+    )
+
+    tui._print_species_check_report(console, report, asset)
+    text = console.export_text()
+
+    assert "Reference 元数据" in text
+    assert "genes.gtf" in text
+    assert "HISAT2 index" in text
+
+
+def test_ensure_reference_species_metadata_infers_glycine_from_urls(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.references import ReferenceAsset
+
+    root = tmp_path / "glycine_max"
+    root.mkdir()
+    asset = ReferenceAsset(
+        reference_id="glycine_max",
+        root=root,
+        fasta=root / "genome.fa",
+        annotation=root / "annotation.gtf",
+        hisat2_index=root / "hisat2" / "genome",
+        created_at="",
+        updated_at="",
+        provider="ensembl",
+        annotation_provider="ensembl",
+        source_urls=[
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/glycine_max/dna/Glycine_max.Glycine_max_v2.1.dna.toplevel.fa.gz",
+            "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/gtf/glycine_max/Glycine_max.Glycine_max_v2.1.60.gtf.gz",
+        ],
+    )
+
+    updated = tui._ensure_reference_species_metadata(asset)
+
+    assert updated.species == "glycine_max"
+    assert updated.taxon_id == "3847"
+    assert updated.release == "current"
+    assert '"species": "glycine_max"' in (root / "reference.json").read_text(encoding="utf-8")
 
 
 def test_workflow_download_progress_detail_compacts_long_messages():
@@ -1935,73 +2198,52 @@ def test_choice_with_custom_keeps_custom_option_as_value(monkeypatch):
     )
 
 
-def test_register_reference_wizard_cancel_edit_does_not_advance(monkeypatch):
+def test_register_reference_wizard_cancel_input_does_not_advance(monkeypatch):
     from rnaseq_workflow.cli import tui
 
-    choices = iter(["edit", "next", "back"])
     seen_titles = []
 
-    def fake_menu(title, text, values):
+    def fake_input_page(title, field_title, text, default="", has_previous=False):
         seen_titles.append(title)
-        return next(choices)
+        return None
 
-    monkeypatch.setattr(tui, "_menu", fake_menu)
-    monkeypatch.setattr(tui, "_input", lambda title, text, default="": None)
+    monkeypatch.setattr(tui, "_tool_input_page", fake_input_page)
     monkeypatch.setattr(tui, "_message", lambda title, text: None)
 
     assert tui._register_reference_wizard() is None
-    assert seen_titles == [
-        "登记本地 Reference 1/8",
-        "登记本地 Reference 1/8",
-        "登记本地 Reference 1/8",
-    ]
+    assert seen_titles == ["登记本地 Reference 1/12"]
 
 
-def test_prepare_reference_wizard_cancel_edit_does_not_advance(monkeypatch):
+def test_prepare_reference_wizard_cancel_input_does_not_advance(monkeypatch):
     from rnaseq_workflow.cli import tui
 
-    choices = iter(["edit", "next", "back"])
     seen_titles = []
 
-    def fake_menu(title, text, values):
+    def fake_input_page(title, field_title, text, default="", has_previous=False):
         seen_titles.append(title)
-        return next(choices)
+        return None
 
-    monkeypatch.setattr(tui, "_menu", fake_menu)
-    monkeypatch.setattr(tui, "_input", lambda title, text, default="": None)
+    monkeypatch.setattr(tui, "_tool_input_page", fake_input_page)
     monkeypatch.setattr(tui, "_message", lambda title, text: None)
 
     assert tui._prepare_reference_wizard() is None
-    assert seen_titles == [
-        "准备 Reference 1/13",
-        "准备 Reference 1/13",
-        "准备 Reference 1/13",
-    ]
+    assert seen_titles == ["准备 Reference 1/15"]
 
 
-def test_build_reference_index_wizard_cancel_edit_does_not_advance(monkeypatch):
+def test_build_reference_index_wizard_cancel_choice_does_not_advance(monkeypatch):
     from rnaseq_workflow.cli import tui
 
-    choices = iter(["edit", "next", "back"])
     seen_titles = []
 
-    def fake_menu(title, text, values):
+    def fake_choice_page(title, field_title, text, values, current_value="", has_previous=False, is_last=False):
         seen_titles.append(title)
-        return next(choices)
+        return None
 
-    monkeypatch.setattr(tui, "_menu", fake_menu)
+    monkeypatch.setattr(tui, "_tool_choice_page", fake_choice_page)
     monkeypatch.setattr(tui, "_message", lambda title, text: None)
-    monkeypatch.setattr(tui, "_execution_mode_input", lambda default="docker": None)
-    monkeypatch.setattr(tui, "_docker_image_input", lambda default="rnaseq-workflow:tools": None)
-    monkeypatch.setattr(tui, "_optional_yes_no", lambda title, default: None)
-    monkeypatch.setattr(tui, "_int_input", lambda title, default, minimum=None, cancel_returns_default=False: None)
 
     assert tui._build_reference_index_wizard() is None
-    assert seen_titles == [
-        "构建 HISAT2 index 1/5",
-        "构建 HISAT2 index 1/5",
-        "构建 HISAT2 index 2/5",
-    ]
+    assert seen_titles == ["构建 HISAT2 index 1/5"]
 
 
 def test_tool_run_wizard_direct_choice_then_next(monkeypatch):
@@ -2059,6 +2301,60 @@ def test_tool_run_wizard_allows_empty_download_proxy(monkeypatch):
     )
 
     assert result == {"download_proxy": ""}
+
+
+def test_tool_run_wizard_multiselect_field(monkeypatch):
+    from rnaseq_workflow.cli import tui
+
+    calls = []
+    monkeypatch.setattr(
+        tui,
+        "_option_multiselect",
+        lambda title, text, values, default_values=None: calls.append((title, values, default_values)) or ["raw_counts", "fpkm"],
+    )
+
+    result = tui._tool_run_wizard(
+        "工具参数配置",
+        {"formats": ["raw_counts"]},
+        [
+            (
+                "formats",
+                "表达矩阵输出类型",
+                "至少选择一种。",
+                "multiselect",
+                None,
+                (("raw_counts", "raw_counts"), ("fpkm", "FPKM")),
+            )
+        ],
+    )
+
+    assert result == {"formats": ["raw_counts", "fpkm"]}
+    assert calls[0][0] == "表达矩阵输出类型"
+
+
+def test_option_multiselect_uses_keyboard_multiselect(monkeypatch):
+    from rnaseq_workflow.cli import tui
+
+    called = {}
+
+    def fake_keyboard(title, text, values, default_values=None):
+        called["title"] = title
+        called["defaults"] = default_values
+        return ["raw_counts"]
+
+    monkeypatch.setattr(tui, "_keyboard_multiselect", fake_keyboard)
+    monkeypatch.setattr(tui, "checkboxlist_dialog", lambda **kwargs: (_ for _ in ()).throw(AssertionError("old dialog used")))
+
+    assert tui._option_multiselect("表达矩阵输出类型", "至少选择一种。", [("raw_counts", "raw_counts")], ["raw_counts"]) == ["raw_counts"]
+    assert called == {"title": "表达矩阵输出类型", "defaults": ["raw_counts"]}
+
+
+def test_workflow_step_plan_adds_stringtie_when_selected():
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.task_params import TaskParams
+
+    assert "stringtie" not in tui._workflow_step_plan(TaskParams(expression_output_formats=["raw_counts"]))
+    assert "stringtie" in tui._workflow_step_plan(TaskParams(expression_output_formats=["stringtie_fpkm"]))
 
 
 def test_tool_run_wizard_input_page_previous(monkeypatch):
@@ -2163,8 +2459,8 @@ def test_workflow_finalize_readiness_waits_for_all_featurecounts(tmp_path):
 
     message = tui._workflow_finalize_readiness(task, samples)
 
-    assert "需等待全部样本 featureCounts 完成" in message
-    assert "S2=PENDING" in message
+    assert "需等待全部样本定量步骤完成" in message
+    assert "S2:featurecounts=PENDING" in message
 
 
 def test_finalize_completed_workflow_runs_after_all_featurecounts(monkeypatch, tmp_path):
@@ -2219,3 +2515,34 @@ def test_workflow_finalize_display_text_contains_output_paths(tmp_path):
     assert "count_matrix:" in text
     assert "report_json:" in text
     assert "report_markdown:" in text
+
+
+def test_workflow_status_counts_use_progress_file_for_cached_steps(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.models import Sample, StepResult, StepStatus
+    from rnaseq_workflow.persistence.json_state import JsonStateRepository
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    repo = JsonStateRepository(task.progress_path)
+    samples = [Sample("S1", tmp_path / "S1.fastq"), Sample("S2", tmp_path / "S2.fastq")]
+
+    class Step:
+        name = "Step"
+
+        def __init__(self, step_id):
+            self.step_id = step_id
+
+    steps = [Step("download"), Step("featurecounts")]
+    for sample in samples:
+        for step in steps:
+            repo.mark_running(sample, step)
+            status = StepStatus.SKIPPED if step.step_id == "download" else StepStatus.COMPLETED
+            repo.save_step_result(step, StepResult(sample.sample_id, step.step_id, status))
+
+    counts = tui._workflow_status_counts(task, samples, steps)
+
+    assert counts["total"] == 4
+    assert counts[StepStatus.COMPLETED.value] == 2
+    assert counts[StepStatus.SKIPPED.value] == 2
+    assert counts[StepStatus.FAILED.value] == 0

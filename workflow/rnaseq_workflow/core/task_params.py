@@ -11,6 +11,7 @@ from rnaseq_workflow.core.assets import TaskWorkspace
 EXECUTION_MODES = {"sample_pipeline", "stage_batch"}
 CLEANUP_POLICIES = {"cleanup_after_task", "cleanup_after_step", "no_auto_cleanup"}
 DISK_GUARD_STRATEGIES = {"cancel", "transfer"}
+EXPRESSION_OUTPUT_FORMATS = {"raw_counts", "cpm", "fpkm", "tpm", "stringtie_fpkm", "stringtie_tpm"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,8 @@ class TaskParams:
     featurecounts_attribute_type: str = "gene_id"
     featurecounts_strandness: int = 0
     featurecounts_paired: bool = False
+    stringtie_threads: int = 2
+    expression_output_formats: list[str] = field(default_factory=lambda: ["raw_counts", "fpkm"])
     reference_id: str = ""
     reference_dir: str = ""
     hisat2_index: str = ""
@@ -92,6 +95,7 @@ def validate_task_params(params: TaskParams) -> list[ParamIssue]:
         "hisat2_threads",
         "samtools_threads",
         "featurecounts_threads",
+        "stringtie_threads",
     ):
         if int(getattr(params, field)) < 1:
             issues.append(ParamIssue(field, "must be >= 1"))
@@ -99,6 +103,11 @@ def validate_task_params(params: TaskParams) -> list[ParamIssue]:
         issues.append(ParamIssue("trim_quality", "must be between 0 and 40"))
     if int(params.featurecounts_strandness) not in {0, 1, 2}:
         issues.append(ParamIssue("featurecounts_strandness", "must be 0, 1, or 2"))
+    if not params.expression_output_formats:
+        issues.append(ParamIssue("expression_output_formats", "at least one output format must be selected"))
+    invalid_formats = [item for item in params.expression_output_formats if str(item).strip().lower() not in EXPRESSION_OUTPUT_FORMATS]
+    if invalid_formats:
+        issues.append(ParamIssue("expression_output_formats", "unsupported formats: " + ", ".join(str(item) for item in invalid_formats)))
     if not str(params.download_source or "").strip():
         issues.append(ParamIssue("download_source", "must not be empty"))
     if float(params.disk_guard_min_free_gb) < 0:

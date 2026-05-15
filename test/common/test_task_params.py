@@ -30,6 +30,7 @@ def test_validate_task_params_reports_invalid_values():
         disk_guard_min_free_gb=-1,
         disk_guard_min_free_percent=101,
         disk_guard_strategy="bad",
+        expression_output_formats=[],
     )
 
     issues = validate_task_params(params)
@@ -42,6 +43,7 @@ def test_validate_task_params_reports_invalid_values():
         "disk_guard_min_free_gb",
         "disk_guard_min_free_percent",
         "disk_guard_strategy",
+        "expression_output_formats",
     }
 
 
@@ -61,6 +63,8 @@ def test_task_params_roundtrip(tmp_path):
     assert read_task_params(path).download_workers == 1
     assert read_task_params(path).download_proxy == "http://127.0.0.1:7890"
     assert read_task_params(path).spill_paths == [str(tmp_path / "spill-a"), str(tmp_path / "spill-b")]
+    assert read_task_params(path).expression_output_formats == ["raw_counts", "fpkm"]
+    assert read_task_params(path).stringtie_threads == 2
 
 
 def test_read_task_params_backfills_download_workers(tmp_path):

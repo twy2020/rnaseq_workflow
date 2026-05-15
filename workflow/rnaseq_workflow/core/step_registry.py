@@ -6,7 +6,7 @@ from rnaseq_workflow.steps.alignment import Hisat2AlignStep, SamtoolsSortStep
 from rnaseq_workflow.steps.data_ingestion import SraToFastqStep
 from rnaseq_workflow.steps.placeholder import PlaceholderStep
 from rnaseq_workflow.steps.quality_control import FastQCStep
-from rnaseq_workflow.steps.quantification import FeatureCountsStep
+from rnaseq_workflow.steps.quantification import FeatureCountsStep, StringTieStep
 from rnaseq_workflow.steps.read_trimming import TrimGaloreStep
 
 
@@ -66,6 +66,7 @@ _STEP_FACTORIES = {
     "hisat2": Hisat2AlignStep,
     "samtools_sort": SamtoolsSortStep,
     "featurecounts": FeatureCountsStep,
+    "stringtie": StringTieStep,
 }
 
 _STAGE_EXPANSIONS = {

@@ -19,6 +19,14 @@ def _write_featurecounts(path, sample_name: str, rows: list[tuple[str, int]]) ->
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _write_stringtie_abundance(path, rows: list[tuple[str, float, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["Gene ID\tGene Name\tReference\tStrand\tStart\tEnd\tCoverage\tFPKM\tTPM"]
+    for gene_id, fpkm, tpm in rows:
+        lines.append(f"{gene_id}\t{gene_id}\tchr1\t+\t1\t10\t1\t{fpkm}\t{tpm}")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def test_finalize_project_merges_counts_and_writes_reports(tmp_path):
     output_dir = tmp_path / "output"
     samples = [
@@ -45,6 +53,47 @@ def test_finalize_project_merges_counts_and_writes_reports(tmp_path):
     ]
     assert json.loads(result.report_json.read_text(encoding="utf-8"))["project_id"] == "demo"
     assert "# RNA-seq Workflow Report: demo" in result.report_markdown.read_text(encoding="utf-8")
+
+
+def test_finalize_project_writes_selected_expression_outputs(tmp_path):
+    output_dir = tmp_path / "output"
+    samples = [
+        Sample(sample_id="S1", source_path=tmp_path / "S1.fastq"),
+        Sample(sample_id="S2", source_path=tmp_path / "S2.fastq"),
+    ]
+    _write_featurecounts(output_dir / "samples" / "S1" / "quantification" / "S1.featureCounts.txt", "S1", [("geneA", 100)])
+    _write_featurecounts(output_dir / "samples" / "S2" / "quantification" / "S2.featureCounts.txt", "S2", [("geneA", 50)])
+    (output_dir / "progress.json").parent.mkdir(parents=True, exist_ok=True)
+    (output_dir / "progress.json").write_text(json.dumps({"samples": {}}), encoding="utf-8")
+
+    result = finalize_project("demo", output_dir, samples, output_formats=["raw_counts", "fpkm", "tpm"])
+
+    assert set(result.expression_matrices or {}) == {"raw_counts", "fpkm", "tpm"}
+    assert result.expression_matrices["raw_counts"].name == "raw_counts.tsv"
+    assert result.expression_matrices["fpkm"].name == "fpkm.tsv"
+    assert result.expression_matrices["tpm"].name == "tpm.tsv"
+    assert result.expression_matrices["fpkm"].exists()
+    assert result.expression_matrices["tpm"].exists()
+
+
+def test_finalize_project_writes_stringtie_outputs(tmp_path):
+    output_dir = tmp_path / "output"
+    samples = [
+        Sample(sample_id="S1", source_path=tmp_path / "S1.fastq"),
+        Sample(sample_id="S2", source_path=tmp_path / "S2.fastq"),
+    ]
+    _write_stringtie_abundance(output_dir / "samples" / "S1" / "quantification" / "S1.stringtie.gene_abund.tsv", [("geneA", 3.5, 7.0)])
+    _write_stringtie_abundance(output_dir / "samples" / "S2" / "quantification" / "S2.stringtie.gene_abund.tsv", [("geneA", 1.25, 2.5)])
+    (output_dir / "progress.json").parent.mkdir(parents=True, exist_ok=True)
+    (output_dir / "progress.json").write_text(json.dumps({"samples": {}}), encoding="utf-8")
+
+    result = finalize_project("demo", output_dir, samples, output_formats=["stringtie_fpkm", "stringtie_tpm"])
+
+    assert set(result.expression_matrices or {}) == {"stringtie_fpkm", "stringtie_tpm"}
+    assert result.expression_matrices["stringtie_fpkm"].read_text(encoding="utf-8").splitlines() == [
+        "Geneid\tS1\tS2",
+        "geneA\t3.5\t1.25",
+    ]
 
 
 def test_finalize_project_requires_featurecounts_outputs(tmp_path):

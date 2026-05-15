@@ -68,6 +68,7 @@ from rnaseq_workflow.core.references import (
     load_reference,
     reference_config_values,
     register_reference,
+    write_reference,
 )
 from rnaseq_workflow.core.samples import samples_from_config
 from rnaseq_workflow.core.step_registry import build_pipeline_steps
@@ -94,16 +95,46 @@ from rnaseq_workflow.steps.download import (
     split_sra_targets,
     write_sra_metadata_sidecars,
 )
+from rnaseq_workflow.steps.download.runinfo import SraRunMetadata
 from rnaseq_workflow.steps.download.cache import find_partial_sra_artifacts
 from rnaseq_workflow.steps.alignment import Hisat2AlignStep, SamtoolsSortStep
 from rnaseq_workflow.steps.quality_control import FastQCStep
 from rnaseq_workflow.steps.quantification import FeatureCountsStep, merge_featurecounts_files, write_count_matrix_tsv
+from rnaseq_workflow.core.finalize import normalize_expression_output_formats
 from rnaseq_workflow.steps.reporting import build_project_report, write_report_json, write_report_markdown
 from rnaseq_workflow.steps.read_trimming import TrimGaloreStep
 
 
 DEFAULT_TUI_CONCURRENCY = 6
 DEFAULT_HEAVY_STEP_CONCURRENCY = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeciesCheckRow:
+    sample_id: str
+    sample_species: str
+    sample_taxid: str
+    reference_species: str
+    reference_taxid: str
+    status: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeciesCheckReport:
+    rows: list[_SpeciesCheckRow]
+
+    @property
+    def mismatches(self) -> list[_SpeciesCheckRow]:
+        return [row for row in self.rows if row.status == "mismatch"]
+
+    @property
+    def unknowns(self) -> list[_SpeciesCheckRow]:
+        return [row for row in self.rows if row.status == "unknown"]
+
+    @property
+    def ok(self) -> bool:
+        return not self.mismatches
 
 
 STYLE = Style.from_dict(
@@ -302,9 +333,10 @@ def _workflow_menu(state: TuiState) -> None:
                 ("prepare", f"1 创建/选择任务  {_status_badge(bool(state.task))}"),
                 ("reference", f"2 选择 Reference  {_status_badge(_task_reference_selected(state))}"),
                 ("manifest", f"3 提交清单  {_status_badge(_task_file_exists(state, 'manifest.json'))}"),
-                ("params", f"4 工具配置  {_status_badge(_task_file_exists(state, 'params.json'))}"),
-                ("check", f"5 资源检查  {_status_badge(_task_file_exists(state, 'resource_check.json'))}"),
-                ("run", "6 正式运行"),
+                ("sample_metadata", "4 样本元数据更新/手动修改"),
+                ("params", f"5 工具配置  {_status_badge(_task_file_exists(state, 'params.json'))}"),
+                ("check", f"6 资源检查  {_status_badge(_task_file_exists(state, 'resource_check.json'))}"),
+                ("run", "7 正式运行"),
                 ("back", "返回"),
             ],
         )
@@ -316,6 +348,8 @@ def _workflow_menu(state: TuiState) -> None:
             _workflow_reference_page(state)
         elif choice == "manifest":
             _workflow_manifest_page(state)
+        elif choice == "sample_metadata":
+            _task_sample_metadata_page(state)
         elif choice == "params":
             _workflow_params_page(state)
         elif choice == "check":
@@ -358,14 +392,16 @@ def _task_metadata_file_exists(task: TaskWorkspace, filename: str) -> bool:
 
 
 def _asset_status_text(state: TuiState) -> str:
+    registry = _PathDisplayRegistry()
     lines = [
-        f"[资产根目录] {state.asset_root}",
+        f"[资产根目录] {registry.inline(state.asset_root, as_file=False)}",
         f"[账号] {state.username or '未登录'}",
         f"[用户ID] {state.user_id or '未设置'}",
         f"[当前任务] {_current_task_display(state)}",
     ]
     if state.task:
-        lines.append(f"[任务目录] {state.task.root}")
+        lines.append(f"[任务目录] {registry.inline(state.task.root, as_file=False)}")
+    lines.extend(registry.lines())
     return "\n".join(lines)
 
 
@@ -416,6 +452,7 @@ def _task_management_menu(state: TuiState) -> None:
                 ("edit", "修改当前任务名称/描述"),
                 ("delete", "删除当前任务"),
                 ("show", "查看当前任务"),
+                ("sample_metadata", "样本元数据更新/手动修改"),
                 ("stats", "产物统计"),
                 ("cleanup_outputs", "产物清理"),
                 ("workflow", "进入 Workflow 向导"),
@@ -438,6 +475,8 @@ def _task_management_menu(state: TuiState) -> None:
             _delete_current_task(state)
         elif choice == "show":
             _show_current_task(state)
+        elif choice == "sample_metadata":
+            _task_sample_metadata_page(state)
         elif choice == "stats":
             _task_artifact_stats_page(state)
         elif choice == "cleanup_outputs":
@@ -685,6 +724,83 @@ class _ArtifactTarget:
     files: int
     size_bytes: int
     description: str
+    external: bool = False
+
+
+class _PathDisplayRegistry:
+    def __init__(self, prefix: str = "D") -> None:
+        self.prefix = prefix
+        self._entries: list[Path] = []
+        self._index_by_key: dict[str, int] = {}
+
+    def compact(self, path: Path | str, *, as_file: bool | None = None) -> tuple[str, str]:
+        path = Path(path)
+        work_dir, leaf = _path_display_parts(path, as_file=as_file)
+        key = _path_identity(work_dir)
+        if key not in self._index_by_key:
+            self._index_by_key[key] = len(self._entries) + 1
+            self._entries.append(work_dir)
+        return f"{self.prefix}{self._index_by_key[key]}", leaf
+
+    def inline(self, path: Path | str, *, as_file: bool | None = None) -> str:
+        ref, leaf = self.compact(path, as_file=as_file)
+        return f"{ref}/{leaf}" if leaf else ref
+
+    def lines(self, title: str = "工作目录") -> list[str]:
+        if not self._entries:
+            return []
+        return [f"{title}:"] + [f"{self.prefix}{index}: {path}" for index, path in enumerate(self._entries, start=1)]
+
+    def text(self, title: str = "工作目录") -> str:
+        return "\n".join(self.lines(title))
+
+
+def _path_display_parts(path: Path, *, as_file: bool | None = None) -> tuple[Path, str]:
+    if as_file is None:
+        as_file = path.suffix != ""
+    if as_file:
+        work_dir = path.parent
+        leaf = path.name
+    else:
+        work_dir = path.parent if path.name else path
+        leaf = path.name
+    if not leaf:
+        leaf = str(path)
+    return work_dir, leaf
+
+
+def _field_page_text(
+    data: dict[str, Any],
+    key: str,
+    help_text: str,
+    formatter: Callable[[str, Any], str] | None = None,
+) -> str:
+    formatter = formatter or _format_prepare_reference_value
+    value = formatter(key, data.get(key))
+    label = "已填" if value != "未设置" else "默认/待填"
+    return f"{label}: {value}\n\n{help_text}"
+
+
+_PATH_LIKE_RE = re.compile(
+    r"(?P<path>(?:[A-Za-z]:[\\/][^ \t\r\n;，。]+|[/\\](?:[^ \t\r\n;，。/\\]+[/\\])+[^ \t\r\n;，。]+|(?:workspace|runtime_logs)[\\/][^ \t\r\n;，。]+))"
+)
+
+
+def _compact_paths_in_text(text: str, registry: _PathDisplayRegistry, *, max_replacements: int = 8) -> str:
+    if not text:
+        return text
+    replacements = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal replacements
+        raw = match.group("path").rstrip(".,;:，。)")
+        suffix = match.group("path")[len(raw) :]
+        if not raw or replacements >= max_replacements:
+            return match.group("path")
+        replacements += 1
+        return registry.inline(raw) + suffix
+
+    return _PATH_LIKE_RE.sub(replace, text)
 
 
 def _task_artifact_stats_page(state: TuiState) -> None:
@@ -713,7 +829,9 @@ def _task_artifact_cleanup_page(state: TuiState) -> None:
         if not selected:
             _message("无需清理", "没有找到可清理的产物。")
             continue
-        detail = "\n".join(f"{target.label}: {_format_bytes(target.size_bytes)}  {target.path}" for target in selected)
+        registry = _PathDisplayRegistry()
+        detail_lines = [f"{target.label}: {_format_bytes(target.size_bytes)}  {registry.inline(target.path, as_file=False)}" for target in selected]
+        detail = "\n".join([*detail_lines, "", registry.text()])
         if not _confirm_yes(f"确认清理以下产物？\n{detail}", False):
             continue
         removed = _remove_task_artifacts(task, selected)
@@ -721,17 +839,48 @@ def _task_artifact_cleanup_page(state: TuiState) -> None:
 
 
 def _task_artifact_targets(task: TaskWorkspace) -> list[_ArtifactTarget]:
-    targets = [
+    local_targets = [
         ("downloads", "下载文件", task.downloads_dir, "下载得到的 FASTQ/SRA 和半成品。"),
         ("inputs", "输入记录", task.inputs_dir, "本地输入记录和路径索引。"),
         ("samples", "样本中间产物", task.samples_dir, "按样本组织的 FASTQ、QC、比对和计数中间产物。"),
         ("logs", "日志", task.logs_dir, "运行日志和命令输出。"),
         ("reports", "报告", task.reports_dir, "矩阵、JSON、Markdown 和下载报告。"),
     ]
-    return [
+    targets = [
         _ArtifactTarget(key, label, path, *_path_file_count_size(path), description)
-        for key, label, path, description in targets
+        for key, label, path, description in local_targets
     ]
+    targets.extend(_external_artifact_targets(task, { _path_identity(path) for _, _, path, _ in local_targets }))
+    return targets
+
+
+def _external_artifact_targets(task: TaskWorkspace, known_paths: set[str]) -> list[_ArtifactTarget]:
+    targets: list[_ArtifactTarget] = []
+    for index, record in enumerate(_read_artifact_location_records(task), start=1):
+        if record.get("task_id") != task.task_id:
+            continue
+        raw_path = str(record.get("current_path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        identity = _path_identity(path)
+        if identity in known_paths:
+            continue
+        known_paths.add(identity)
+        files, size_bytes = _path_file_count_size(path)
+        label = "跨盘样本产物" if path.name == "samples" else "跨盘产物"
+        reason = str(record.get("reason") or "已记录的跨盘产物")
+        original = str(record.get("original_path") or "")
+        description = f"{reason}; 原路径: {original}" if original else reason
+        targets.append(_ArtifactTarget(f"external_{index}", label, path, files, size_bytes, description, external=True))
+    return targets
+
+
+def _path_identity(path: Path) -> str:
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path.absolute()).casefold()
 
 
 def _path_file_count_size(path: Path) -> tuple[int, int]:
@@ -751,37 +900,50 @@ def _safe_file_size(path: Path) -> int:
 
 
 def _print_task_artifact_stats(console: Console, task: TaskWorkspace, targets: list[_ArtifactTarget]) -> None:
+    registry = _PathDisplayRegistry()
     table = Table(title="任务产物统计")
     table.add_column("类别")
     table.add_column("文件数", justify="right")
     table.add_column("大小", justify="right")
-    table.add_column("路径")
+    table.add_column("工作目录")
+    table.add_column("末级目录")
     for target in targets:
-        table.add_row(target.label, str(target.files), _format_bytes(target.size_bytes), str(target.path))
+        ref, leaf = registry.compact(target.path, as_file=False)
+        table.add_row(target.label, str(target.files), _format_bytes(target.size_bytes), ref, leaf)
     table.add_section()
-    table.add_row("合计", str(sum(target.files for target in targets)), _format_bytes(sum(target.size_bytes for target in targets)), str(task.root))
+    ref, leaf = registry.compact(task.root, as_file=False)
+    table.add_row("合计", str(sum(target.files for target in targets)), _format_bytes(sum(target.size_bytes for target in targets)), ref, leaf)
     console.print(table)
+    if registry.text():
+        console.print(registry.text())
 
 
 def _task_artifact_cleanup_text(targets: list[_ArtifactTarget]) -> str:
-    lines = ["选择要清理的产物类别。任务配置和元数据会保留。", ""]
+    registry = _PathDisplayRegistry()
+    lines = ["选择要清理的产物类别。任务配置和元数据会保留。跨盘产物仅清理本任务已登记的路径。", ""]
     for target in targets:
-        lines.append(f"{target.label}: {_format_bytes(target.size_bytes)} / {target.files} files")
+        suffix = " (跨盘)" if target.external else ""
+        lines.append(f"{target.label}{suffix}: {_format_bytes(target.size_bytes)} / {target.files} files  {registry.inline(target.path, as_file=False)}")
+    if registry.text():
+        lines.extend(["", registry.text()])
     return "\n".join(lines)
 
 
 def _artifact_targets_for_choice(choice: str, targets: list[_ArtifactTarget]) -> list[_ArtifactTarget]:
     if choice == "all_intermediate":
-        return [target for target in targets if target.key in {"downloads", "samples", "logs"}]
+        return [target for target in targets if target.key in {"downloads", "samples", "logs"} or target.external]
     return [target for target in targets if target.key == choice]
 
 
 def _remove_task_artifacts(task: TaskWorkspace, targets: list[_ArtifactTarget]) -> int:
     removed = 0
     root = task.root.resolve()
+    allowed_external_paths = _registered_external_artifact_paths(task)
     for target in targets:
         path = target.path.resolve()
-        if path == root or root not in path.parents:
+        inside_task = path != root and root in path.parents
+        registered_external = target.external and _path_identity(path) in allowed_external_paths
+        if not inside_task and not registered_external:
             raise ValueError(f"refuse to clean outside task dir: {path}")
         removed += target.size_bytes
         if path.exists():
@@ -792,6 +954,21 @@ def _remove_task_artifacts(task: TaskWorkspace, targets: list[_ArtifactTarget]) 
                 path.unlink()
     task.ensure()
     return removed
+
+
+def _registered_external_artifact_paths(task: TaskWorkspace) -> set[str]:
+    root = task.root.resolve()
+    paths: set[str] = set()
+    for record in _read_artifact_location_records(task):
+        if record.get("task_id") != task.task_id:
+            continue
+        raw_path = str(record.get("current_path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).resolve()
+        if path != root and root not in path.parents:
+            paths.add(_path_identity(path))
+    return paths
 
 
 def _show_cleanup_plan(state: TuiState) -> None:
@@ -815,6 +992,257 @@ def _print_cleanup_targets(console: Console, targets) -> None:
             _format_bytes(target.size_bytes),
         )
     console.print(table)
+
+
+def _task_sample_metadata_page(state: TuiState) -> None:
+    task = _current_or_new_task(state)
+    if not task:
+        return
+    while True:
+        manifest = _read_task_manifest_record(task)
+        choice = _menu(
+            "样本元数据",
+            _sample_metadata_page_text(task, manifest),
+            [
+                ("view", "查看样本元数据"),
+                ("auto", "自动更新 SRA RunInfo 元数据"),
+                ("manual", "手动填写/修改样本元数据"),
+                ("check", "检查样本物种与当前 Reference"),
+                ("back", "返回"),
+            ],
+        )
+        if choice in (None, "back"):
+            return
+        if choice == "view":
+            _capture_output(state, lambda console: _print_task_sample_metadata(console, task), "样本元数据")
+        elif choice == "auto":
+            try:
+                updated, message = _run_simple_task_with_tui_progress(
+                    title="自动更新样本元数据",
+                    description=f"正在从 NCBI RunInfo 获取并写回:\n{task.metadata_dir / 'manifest.json'}",
+                    worker=lambda: _auto_update_task_sample_metadata(task),
+                )
+            except Exception as exc:
+                updated, message = False, f"自动获取 SRA RunInfo 失败: {exc}"
+            if not updated and _yes_no(f"{message}\n是否改为手动填写？", True):
+                _manual_edit_task_sample_metadata(task)
+            else:
+                _message("样本元数据更新", message)
+        elif choice == "manual":
+            _manual_edit_task_sample_metadata(task)
+        elif choice == "check":
+            _show_task_species_check(state, task)
+
+
+def _sample_metadata_page_text(task: TaskWorkspace, manifest: dict[str, Any] | None) -> str:
+    if not manifest:
+        return f"当前任务还没有清单。\n文件: {task.metadata_dir / 'manifest.json'}"
+    summary = _task_sample_metadata_summary(manifest)
+    return "\n".join(
+        [
+            _manifest_status_text(task),
+            f"样本数: {summary['samples']}  已有物种: {summary['species']}  已有 TaxID: {summary['taxid']}",
+            f"metadata rows: {len(manifest.get('metadata') or [])}",
+            f"文件: {task.metadata_dir / 'manifest.json'}",
+        ]
+    )
+
+
+def _task_sample_metadata_summary(manifest: dict[str, Any]) -> dict[str, int]:
+    rows = _task_sample_metadata_rows(manifest)
+    return {
+        "samples": len(rows),
+        "species": sum(1 for row in rows if _metadata_value(row, "scientific_name", "ScientificName", "species", "organism")),
+        "taxid": sum(1 for row in rows if _metadata_value(row, "taxid", "TaxID", "taxon_id")),
+    }
+
+
+def _task_sample_metadata_rows(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    metadata_by_run = _manifest_metadata_by_run(manifest)
+    for accession in [str(item).strip().upper() for item in manifest.get("accessions") or [] if str(item).strip()]:
+        row = dict(metadata_by_run.get(accession, {}))
+        row.setdefault("sample_id", accession)
+        row.setdefault("run", accession)
+        row.setdefault("input_type", "remote_sra")
+        rows.append(row)
+    for local in manifest.get("local_files") or []:
+        if not isinstance(local, dict):
+            continue
+        row = dict(local)
+        row.setdefault("sample_id", str(local.get("sample_id") or local.get("name") or Path(str(local.get("path") or "")).stem))
+        rows.append(row)
+    return rows
+
+
+def _print_task_sample_metadata(console: Console, task: TaskWorkspace) -> None:
+    manifest = _read_task_manifest_record(task)
+    if not manifest:
+        console.print("当前任务还没有清单。")
+        return
+    table = Table(title="任务样本元数据", expand=True)
+    table.add_column("Sample")
+    table.add_column("Run")
+    table.add_column("Type")
+    table.add_column("Organism", min_width=22, no_wrap=True)
+    table.add_column("TaxID")
+    table.add_column("BioProject")
+    table.add_column("Layout")
+    table.add_column("Source")
+    table.add_column("Size")
+    for row in _task_sample_metadata_rows(manifest):
+        table.add_row(
+            str(row.get("sample_id") or row.get("run") or "-"),
+            str(row.get("run") or row.get("accession") or "-"),
+            str(row.get("input_type") or "-"),
+            _metadata_value(row, "scientific_name", "ScientificName", "species", "organism") or "-",
+            _metadata_value(row, "taxid", "TaxID", "taxon_id") or "-",
+            _metadata_value(row, "bioproject", "BioProject") or "-",
+            _metadata_value(row, "library_layout", "LibraryLayout") or "-",
+            _metadata_value(row, "library_source", "LibrarySource") or "-",
+            _format_bytes(_coerce_positive_int(row.get("expected_size_bytes") or row.get("size_bytes")) or 0),
+        )
+    console.print(table)
+
+
+def _auto_update_task_sample_metadata(task: TaskWorkspace) -> tuple[bool, str]:
+    manifest = _read_task_manifest_record(task)
+    if not manifest:
+        return False, "当前任务还没有清单。"
+    accessions = [str(item).strip().upper() for item in manifest.get("accessions") or [] if str(item).strip()]
+    if not accessions:
+        return False, "当前清单没有 SRA accession；本地数据请使用手动填写。"
+    try:
+        records = fetch_sra_metadata(accessions, timeout_seconds=20.0)
+    except Exception as exc:
+        return False, f"自动获取 SRA RunInfo 失败: {exc}"
+    if not records:
+        return False, "NCBI RunInfo 没有返回记录。"
+    changed = _merge_manifest_sra_metadata(manifest, records)
+    _write_task_manifest_record(task, manifest)
+    return True, f"已更新 {len(records)} 条 RunInfo 元数据；changed={changed}\n{task.metadata_dir / 'manifest.json'}"
+
+
+def _manual_edit_task_sample_metadata(task: TaskWorkspace) -> bool:
+    manifest = _read_task_manifest_record(task)
+    if not manifest:
+        _message("样本元数据", "当前任务还没有清单。")
+        return False
+    choices = [(row["key"], row["label"]) for row in _sample_metadata_edit_choices(manifest)]
+    if not choices:
+        _message("样本元数据", "当前清单没有可编辑样本。")
+        return False
+    choices.append(("back", "返回"))
+    selected = _menu("选择样本", "选择要手动填写/修改元数据的样本。", choices)
+    if selected in (None, "back"):
+        return False
+    row = _find_or_create_manifest_sample_metadata(manifest, selected)
+    if row is None:
+        _message("样本元数据", f"未找到样本: {selected}")
+        return False
+    values = _sample_metadata_form_defaults(row)
+    form = _tool_run_wizard(
+        "手动样本元数据",
+        values,
+        [
+            ("sample_id", "样本 ID", "样本显示 ID。", "str", None, ()),
+            ("scientific_name", "物种 scientific_name", "例如 Arabidopsis thaliana / Glycine max。", "str", None, ()),
+            ("taxid", "TaxID", "NCBI Taxonomy ID，例如 Arabidopsis thaliana 为 3702。可留空。", "str", None, ()),
+            ("bioproject", "BioProject", "可留空。", "str", None, ()),
+            ("biosample", "BioSample", "可留空。", "str", None, ()),
+            ("library_layout", "文库布局", "SINGLE / PAIRED / UNKNOWN。", "choice_custom", None, (("SINGLE", "SINGLE"), ("PAIRED", "PAIRED"), ("UNKNOWN", "UNKNOWN"))),
+            ("library_source", "文库来源", "例如 TRANSCRIPTOMIC。可留空。", "str", None, ()),
+            ("library_strategy", "文库策略", "例如 RNA-Seq。可留空。", "str", None, ()),
+        ],
+    )
+    if form is None:
+        return False
+    _apply_sample_metadata_form(row, form)
+    _write_task_manifest_record(task, manifest)
+    _message("样本元数据已保存", f"{form['sample_id']}\n{task.metadata_dir / 'manifest.json'}")
+    return True
+
+
+def _sample_metadata_edit_choices(manifest: dict[str, Any]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for accession in [str(item).strip().upper() for item in manifest.get("accessions") or [] if str(item).strip()]:
+        metadata = _manifest_metadata_by_run(manifest).get(accession, {})
+        species = _metadata_value(metadata, "scientific_name", "ScientificName", "species", "organism") or "未填写物种"
+        rows.append({"key": f"run:{accession}", "label": f"{accession}  {species}"})
+    for index, local in enumerate(manifest.get("local_files") or []):
+        if not isinstance(local, dict):
+            continue
+        sample_id = str(local.get("sample_id") or local.get("name") or Path(str(local.get("path") or "")).stem)
+        species = _metadata_value(local, "scientific_name", "ScientificName", "species", "organism") or "未填写物种"
+        rows.append({"key": f"local:{index}", "label": f"{sample_id}  {species}"})
+    return rows
+
+
+def _find_or_create_manifest_sample_metadata(manifest: dict[str, Any], key: str) -> dict[str, Any] | None:
+    if key.startswith("run:"):
+        accession = key.split(":", 1)[1].strip().upper()
+        metadata = [row for row in manifest.get("metadata") or [] if isinstance(row, dict)]
+        by_run = {str(row.get("run") or row.get("Run") or row.get("accession") or "").strip().upper(): row for row in metadata}
+        row = by_run.get(accession)
+        if row is None:
+            row = {"run": accession, "sample_id": accession, "input_type": "remote_sra"}
+            metadata.append(row)
+            manifest["metadata"] = metadata
+        row.setdefault("run", accession)
+        row.setdefault("sample_id", accession)
+        row.setdefault("input_type", "remote_sra")
+        return row
+    if key.startswith("local:"):
+        try:
+            index = int(key.split(":", 1)[1])
+            local_files = manifest.get("local_files") or []
+            row = local_files[index]
+        except (ValueError, IndexError, TypeError):
+            return None
+        return row if isinstance(row, dict) else None
+    return None
+
+
+def _sample_metadata_form_defaults(row: dict[str, Any]) -> dict[str, str]:
+    sample_id = _metadata_value(row, "sample_id", "run", "accession", "name")
+    return {
+        "sample_id": sample_id,
+        "scientific_name": _metadata_value(row, "scientific_name", "ScientificName", "species", "organism"),
+        "taxid": _metadata_value(row, "taxid", "TaxID", "taxon_id"),
+        "bioproject": _metadata_value(row, "bioproject", "BioProject"),
+        "biosample": _metadata_value(row, "biosample", "BioSample"),
+        "library_layout": _metadata_value(row, "library_layout", "LibraryLayout") or "UNKNOWN",
+        "library_source": _metadata_value(row, "library_source", "LibrarySource"),
+        "library_strategy": _metadata_value(row, "library_strategy", "LibraryStrategy"),
+    }
+
+
+def _apply_sample_metadata_form(row: dict[str, Any], form: dict[str, Any]) -> None:
+    for key in ("sample_id", "scientific_name", "taxid", "bioproject", "biosample", "library_layout", "library_source", "library_strategy"):
+        value = str(form.get(key) or "").strip()
+        if value:
+            row[key] = value
+        else:
+            row.pop(key, None)
+    if row.get("scientific_name"):
+        row["species"] = row["scientific_name"]
+    if row.get("taxid"):
+        row["taxon_id"] = row["taxid"]
+
+
+def _show_task_species_check(state: TuiState, task: TaskWorkspace) -> None:
+    metadata = task.read_metadata()
+    if not metadata or not metadata.reference_id:
+        _message("Reference 未设置", "请先给任务选择 Reference。")
+        return
+    try:
+        asset = _load_task_reference_asset(task, metadata.reference_id)
+    except FileNotFoundError as exc:
+        _message("Reference 错误", str(exc))
+        return
+    asset = _ensure_reference_species_metadata(asset)
+    report = _check_manifest_species_against_reference(task, asset)
+    _capture_output(state, lambda console: _print_species_check_report(console, report, asset), "样本物种与 Reference 检查")
 
 
 def _workflow_manifest_page(state: TuiState) -> None:
@@ -849,16 +1277,14 @@ def _workflow_manifest_page(state: TuiState) -> None:
     parsed = parse_task_manifest(raw)
     manifest_data = parsed.to_dict()
     if parsed.accessions:
-        _enrich_manifest_expected_sizes(manifest_data)
-    manifest_path = task.metadata_dir / "manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _enrich_manifest_sra_metadata(manifest_data)
+    _write_task_manifest_record(task, manifest_data)
     if not parsed.ok:
         _message("清单校验失败", "\n".join(parsed.errors))
         return
     _message(
         "清单已保存",
-        f"accessions={len(parsed.accessions)}\nurls={len(parsed.urls)}\n{manifest_path}",
+        f"accessions={len(parsed.accessions)}\nurls={len(parsed.urls)}\n{task.metadata_dir / 'manifest.json'}",
     )
 
 
@@ -991,14 +1417,19 @@ def _sample_id_from_local_file(path: Path) -> str:
 
 
 def _print_local_manifest_scan(console: Console, files: list[dict[str, Any]], errors: list[str]) -> None:
+    registry = _PathDisplayRegistry()
     table = Table(title="本地数据扫描")
     table.add_column("Sample")
     table.add_column("Type")
     table.add_column("Size")
-    table.add_column("Path")
+    table.add_column("工作目录")
+    table.add_column("文件")
     for row in files:
-        table.add_row(str(row["sample_id"]), str(row["input_type"]), _format_bytes(int(row["size_bytes"])), str(row["path"]))
+        ref, leaf = registry.compact(str(row["path"]), as_file=True)
+        table.add_row(str(row["sample_id"]), str(row["input_type"]), _format_bytes(int(row["size_bytes"])), ref, leaf)
     console.print(table)
+    if registry.text():
+        console.print(registry.text())
     if errors:
         console.print("[yellow]Warnings[/yellow]")
         for error in errors:
@@ -1051,6 +1482,8 @@ def _workflow_params_page(state: TuiState) -> None:
         featurecounts_attribute_type=str(values["featurecounts_attribute_type"]) or attribute_type,
         featurecounts_strandness=int(values["featurecounts_strandness"]),
         featurecounts_paired=bool(values["featurecounts_paired"]),
+        stringtie_threads=int(values["stringtie_threads"]),
+        expression_output_formats=list(values["expression_output_formats"]),
         reference_id=reference_id,
         reference_dir=reference_dir,
         hisat2_index=hisat2_index,
@@ -1131,6 +1564,8 @@ def _task_params_wizard(defaults: TaskParams, feature_type: str, attribute_type:
         ("featurecounts_attribute_type", "featureCounts 属性字段", "选择用于汇总 reads 的基因 ID 字段。GTF 通常为 gene_id；GFF 常见 gene 或 ID。", "choice_custom", None, (("gene_id", "gene_id"), ("gene", "gene"), ("ID", "ID"))),
         ("featurecounts_strandness", "链特异性", "0 表示非链特异；1 为正向；2 为反向。不确定时先使用 0。", "choice", None, (("0", "非链特异"), ("1", "正向链特异"), ("2", "反向链特异"))),
         ("featurecounts_paired", "按片段计数", "paired-end 数据通常开启。开启后以 read pair 作为一个片段计数。", "choice", None, (("yes", "是"), ("no", "否"))),
+        ("stringtie_threads", "StringTie 线程数", "仅在选择 StringTie FPKM/TPM 输出时运行 StringTie。", "int", 1, ()),
+        ("expression_output_formats", "表达矩阵输出类型", "至少选择一种。featureCounts FPKM/TPM 基于 Length 后处理；StringTie FPKM/TPM 来自 StringTie -A。", "multiselect", None, (("raw_counts", "raw_counts 原始计数"), ("cpm", "CPM"), ("fpkm", "featureCounts FPKM"), ("tpm", "featureCounts TPM"), ("stringtie_fpkm", "StringTie FPKM"), ("stringtie_tpm", "StringTie TPM"))),
     ]
     defaults_map: dict[str, Any] = {
         "execution_mode": defaults.execution_mode,
@@ -1158,6 +1593,8 @@ def _task_params_wizard(defaults: TaskParams, feature_type: str, attribute_type:
         "featurecounts_attribute_type": attribute_type,
         "featurecounts_strandness": str(defaults.featurecounts_strandness),
         "featurecounts_paired": "yes" if defaults.featurecounts_paired else "no",
+        "stringtie_threads": defaults.stringtie_threads,
+        "expression_output_formats": list(defaults.expression_output_formats),
     }
     result = _tool_run_wizard("工具参数配置", defaults_map, fields)
     if result is not None:
@@ -1168,6 +1605,7 @@ def _task_params_wizard(defaults: TaskParams, feature_type: str, attribute_type:
         result["disk_guard_min_free_percent"] = float(result["disk_guard_min_free_percent"])
         result["spill_large_outputs"] = result["spill_large_outputs"] == "yes"
         result["spill_paths"] = _parse_spill_paths(str(result.get("spill_paths") or ""))
+        result["expression_output_formats"] = normalize_expression_output_formats(list(result.get("expression_output_formats") or []))
     return result
 
 
@@ -1560,6 +1998,7 @@ def _workflow_run_page(state: TuiState) -> None:
     except FileNotFoundError as exc:
         _message("Reference 错误", str(exc))
         return
+    asset = _ensure_reference_species_metadata(asset)
     reference_report = check_reference_asset(asset)
     if not reference_report.ok:
         _message("Reference 未就绪", "\n".join(f"{issue.field}: {issue.message}" for issue in reference_report.issues))
@@ -1574,6 +2013,16 @@ def _workflow_run_page(state: TuiState) -> None:
     if not checks_path.exists():
         _message("资源检查未完成", "请先完成资源检查。")
         return
+    species_report = _check_manifest_species_against_reference(task, asset)
+    if species_report.rows:
+        _capture_output(
+            state,
+            lambda console: _print_species_check_report(console, species_report, asset),
+            "样本物种与 Reference 检查",
+        )
+        if species_report.mismatches and not _yes_no("检测到样本物种与 Reference 不一致，仍继续运行？", False):
+            _message("已阻止运行", "请更换匹配的 reference，或确认样本清单是否正确。")
+            return
     manifest_data = _read_task_manifest_record(task)
     accessions = [str(item) for item in (manifest_data or {}).get("accessions") or []]
     if params.execution_mode == "sample_pipeline" and accessions:
@@ -1586,7 +2035,7 @@ def _workflow_run_page(state: TuiState) -> None:
         processing_semaphore = threading.BoundedSemaphore(max(1, int(params.max_workers)))
         processing_steps = [
             _ProcessingConcurrencyStep(step, processing_semaphore, max_workers=params.max_workers)
-            for step in build_pipeline_steps(["data_ingestion", "quality_control", "read_trimming", "alignment", "quantification"])
+            for step in build_pipeline_steps(_workflow_step_plan(params))
         ]
         steps = [
             _ManifestDownloadStep(_downloader_for_params(params), download_dir, max_workers=params.download_workers),
@@ -1607,7 +2056,7 @@ def _workflow_run_page(state: TuiState) -> None:
                 _message("扫描失败", str(exc))
                 return
             samples = scan.samples
-        steps = build_pipeline_steps(["data_ingestion", "quality_control", "read_trimming", "alignment", "quantification"])
+        steps = build_pipeline_steps(_workflow_step_plan(params))
         runner_workers = params.max_workers
     if not samples:
         _message("未发现样本", "清单没有解析出可处理的 SRA/FASTQ。")
@@ -1636,11 +2085,18 @@ def _workflow_run_page(state: TuiState) -> None:
         processing_workers=params.max_workers,
         download_workers=params.download_workers if params.execution_mode == "sample_pipeline" and accessions else None,
         title="Workflow 正式运行",
-        finalize_callback=lambda: _finalize_completed_workflow(task, context.output_dir, samples),
+        finalize_callback=lambda: _finalize_completed_workflow(task, context.output_dir, samples, params.expression_output_formats),
     )
     _capture_output(
         state,
-        lambda console: _print_workflow_run_summary(console, summary, events, finalize_result, finalize_message),
+        lambda console: _print_workflow_run_summary(
+            console,
+            summary,
+            events,
+            finalize_result,
+            finalize_message,
+            status_counts=_workflow_status_counts(task, samples, steps),
+        ),
         "Workflow 运行结果",
     )
 
@@ -1653,6 +2109,17 @@ def _workflow_processing_output_dir(task: TaskWorkspace, params: TaskParams) -> 
         _record_output_root(task, task.task_output_dir, output_dir, reason="large_outputs_root")
         return output_dir
     return task.task_output_dir
+
+
+def _workflow_step_plan(params: TaskParams) -> list[str]:
+    steps = ["data_ingestion", "quality_control", "read_trimming", "alignment", "featurecounts"]
+    if _stringtie_outputs_enabled(params.expression_output_formats):
+        steps.append("stringtie")
+    return steps
+
+
+def _stringtie_outputs_enabled(formats: list[str]) -> bool:
+    return any(str(item).strip().lower() in {"stringtie_fpkm", "stringtie_tpm"} for item in formats)
 
 
 def _existing_output_root(task: TaskWorkspace) -> Path | None:
@@ -1688,6 +2155,7 @@ def _workflow_reference_page(state: TuiState) -> None:
             ("prepare", "新建并准备 reference"),
             ("register", "登记本地 reference"),
             ("build", "HISAT2 index 构建"),
+            ("metadata", "补充/修改 Reference 元数据"),
             ("check", "检查 reference"),
             ("clear", "清除当前 reference"),
             ("back", "返回"),
@@ -1705,6 +2173,7 @@ def _workflow_reference_page(state: TuiState) -> None:
         except FileNotFoundError as exc:
             _message("Reference 错误", str(exc))
             return
+        asset = _ensure_reference_species_metadata(asset)
         _set_task_reference(task, state, asset)
         _message("已选择", _workflow_reference_detail_text(asset))
     elif choice == "prepare":
@@ -1722,6 +2191,8 @@ def _workflow_reference_page(state: TuiState) -> None:
         if not reference_dir:
             return
         _build_reference_index(reference_dir, state)
+    elif choice == "metadata":
+        _reference_metadata_page(state, task)
     elif choice == "check":
         reference_dir = _reference_workspace_dir(state)
         if not reference_dir:
@@ -1788,6 +2259,302 @@ def _set_task_reference(task: TaskWorkspace, state: TuiState, asset: ReferenceAs
         status=status,
         reference_id=reference_id,
     )
+
+
+def _reference_metadata_page(state: TuiState, task: TaskWorkspace) -> None:
+    metadata = task.read_metadata()
+    if not metadata or not metadata.reference_id:
+        _message("Reference 未设置", "请先选择 Reference。")
+        return
+    try:
+        asset = _load_task_reference_asset(task, metadata.reference_id)
+    except FileNotFoundError as exc:
+        _message("Reference 错误", str(exc))
+        return
+    inferred = _infer_reference_species_metadata(asset)
+    defaults = {
+        "species": asset.species or inferred.get("species", ""),
+        "taxon_id": asset.taxon_id or inferred.get("taxon_id", ""),
+        "assembly": asset.assembly or "",
+        "release": asset.release or inferred.get("release", ""),
+        "provider": asset.provider or "custom",
+        "annotation_provider": asset.annotation_provider or asset.provider or "custom",
+    }
+    form = _tool_run_wizard(
+        "Reference 元数据",
+        defaults,
+        [
+            ("species", "Reference 物种", "例如 glycine_max / Arabidopsis thaliana。用于运行前物种一致性判断。", "str", None, ()),
+            ("taxon_id", "Reference TaxID", "NCBI Taxonomy ID；glycine_max 为 3847，Arabidopsis thaliana 为 3702。可留空。", "str", None, ()),
+            ("assembly", "Assembly", "例如 Glycine_max_v2.1 / TAIR10。可留空。", "str", None, ()),
+            ("release", "Release", "参考来源版本，例如 current 或 Ensembl Plants 60。可留空。", "str", None, ()),
+            ("provider", "参考来源", "例如 ensembl/refseq/custom。", "choice_custom", None, (("ensembl", "ensembl"), ("refseq", "refseq"), ("custom", "custom"))),
+            ("annotation_provider", "注释来源", "通常与参考来源一致。", "choice_custom", None, (("ensembl", "ensembl"), ("refseq", "refseq"), ("custom", "custom"))),
+        ],
+    )
+    if form is None:
+        return
+    updated = _updated_reference_asset(asset, form)
+    write_reference(updated)
+    state.workspace.database.upsert_reference(
+        reference_id=updated.reference_id,
+        reference_dir=updated.root.parent,
+        provider=updated.provider,
+        annotation_provider=updated.annotation_provider,
+        species=updated.species,
+        assembly=updated.assembly,
+        release=updated.release,
+        taxon_id=updated.taxon_id,
+        owner_user_id=task.user_id,
+        scope="private",
+        created_by=updated.created_by,
+        build_status=updated.build_status,
+        description=updated.notes,
+    )
+    _message("Reference 元数据已保存", _workflow_reference_detail_text(updated))
+
+
+def _updated_reference_asset(asset: ReferenceAsset, values: dict[str, Any]) -> ReferenceAsset:
+    return ReferenceAsset(
+        reference_id=asset.reference_id,
+        root=asset.root,
+        fasta=asset.fasta,
+        annotation=asset.annotation,
+        hisat2_index=asset.hisat2_index,
+        created_at=asset.created_at,
+        updated_at=datetime.now().isoformat(timespec="seconds"),
+        provider=str(values.get("provider") or asset.provider or "custom"),
+        annotation_provider=str(values.get("annotation_provider") or asset.annotation_provider or values.get("provider") or asset.provider or "custom"),
+        species=str(values.get("species") or "").strip() or None,
+        assembly=str(values.get("assembly") or "").strip() or None,
+        release=str(values.get("release") or "").strip() or None,
+        taxon_id=str(values.get("taxon_id") or "").strip() or None,
+        source_urls=asset.source_urls,
+        annotation_format=asset.annotation_format,
+        created_by=asset.created_by,
+        build_status=asset.build_status,
+        warnings=asset.warnings,
+        notes=asset.notes,
+    )
+
+
+def _ensure_reference_species_metadata(asset: ReferenceAsset) -> ReferenceAsset:
+    if asset.species and asset.taxon_id:
+        return asset
+    inferred = _infer_reference_species_metadata(asset)
+    if not inferred:
+        return asset
+    values = {
+        "species": asset.species or inferred.get("species", ""),
+        "taxon_id": asset.taxon_id or inferred.get("taxon_id", ""),
+        "assembly": asset.assembly or "",
+        "release": asset.release or inferred.get("release", ""),
+        "provider": asset.provider,
+        "annotation_provider": asset.annotation_provider,
+    }
+    updated = _updated_reference_asset(asset, values)
+    write_reference(updated)
+    return updated
+
+
+def _infer_reference_species_metadata(asset: ReferenceAsset) -> dict[str, str]:
+    haystack = " ".join([asset.reference_id, str(asset.fasta), str(asset.annotation or ""), *asset.source_urls]).lower()
+    species = ""
+    if "arabidopsis_thaliana" in haystack or "arabidopsis-thaliana" in haystack:
+        species = "arabidopsis_thaliana"
+    elif "glycine_max" in haystack or "glycine-max" in haystack:
+        species = "glycine_max"
+    elif "homo_sapiens" in haystack:
+        species = "homo_sapiens"
+    elif "mus_musculus" in haystack:
+        species = "mus_musculus"
+    taxid = _infer_taxid_for_species(species)
+    release = _infer_ensembl_release(asset.source_urls)
+    result: dict[str, str] = {}
+    if species:
+        result["species"] = species
+    if taxid:
+        result["taxon_id"] = taxid
+    if release:
+        result["release"] = release
+    return result
+
+
+def _infer_taxid_for_species(species: str) -> str:
+    key = _normalize_species_key(species)
+    return {"arabidopsis_thaliana": "3702", "glycine_max": "3847", "homo_sapiens": "9606", "mus_musculus": "10090"}.get(key, "")
+
+
+def _infer_ensembl_release(urls: list[str]) -> str:
+    for url in urls:
+        match = re.search(r"/release-([^/]+)/", str(url))
+        if match:
+            return match.group(1)
+        if "/current/" in str(url):
+            return "current"
+    return ""
+
+
+def _check_manifest_species_against_reference(task: TaskWorkspace, asset: ReferenceAsset) -> _SpeciesCheckReport:
+    manifest = _read_task_manifest_record(task)
+    if not manifest:
+        return _SpeciesCheckReport([])
+    rows: list[_SpeciesCheckRow] = []
+    metadata_by_run = _manifest_metadata_by_run(manifest)
+    accessions = [str(item).strip().upper() for item in manifest.get("accessions") or [] if str(item).strip()]
+    missing = [accession for accession in accessions if accession not in metadata_by_run]
+    if missing:
+        try:
+            fetched = fetch_sra_metadata(missing, timeout_seconds=8.0)
+        except Exception:
+            fetched = []
+        if fetched:
+            _merge_manifest_sra_metadata(manifest, fetched)
+            _write_task_manifest_record(task, manifest)
+            metadata_by_run = _manifest_metadata_by_run(manifest)
+    for accession in accessions:
+        rows.append(_species_check_row(accession, metadata_by_run.get(accession, {}), asset))
+    local_files = [row for row in manifest.get("local_files") or [] if isinstance(row, dict)]
+    for row in local_files:
+        sample_id = str(row.get("sample_id") or row.get("name") or Path(str(row.get("path") or "")).stem)
+        rows.append(_species_check_row(sample_id, row, asset))
+    return _SpeciesCheckReport(rows)
+
+
+def _species_check_row(sample_id: str, metadata: dict[str, Any], asset: ReferenceAsset) -> _SpeciesCheckRow:
+    sample_taxid = _metadata_value(metadata, "taxid", "TaxID", "taxon_id")
+    sample_species = _metadata_value(metadata, "scientific_name", "ScientificName", "species", "organism")
+    reference_taxid = str(asset.taxon_id or "").strip()
+    reference_species = str(asset.species or "").strip()
+    if sample_taxid and reference_taxid:
+        if sample_taxid == reference_taxid:
+            return _species_row(sample_id, sample_species, sample_taxid, reference_species, reference_taxid, "match", "TaxID match")
+        return _species_row(sample_id, sample_species, sample_taxid, reference_species, reference_taxid, "mismatch", "TaxID mismatch")
+    sample_key = _normalize_species_key(sample_species)
+    reference_key = _normalize_species_key(reference_species)
+    if sample_key and reference_key:
+        if sample_key == reference_key:
+            return _species_row(sample_id, sample_species, sample_taxid, reference_species, reference_taxid, "match", "species match")
+        return _species_row(sample_id, sample_species, sample_taxid, reference_species, reference_taxid, "mismatch", "species mismatch")
+    return _species_row(sample_id, sample_species, sample_taxid, reference_species, reference_taxid, "unknown", "missing sample or reference species metadata")
+
+
+def _species_row(
+    sample_id: str,
+    sample_species: str,
+    sample_taxid: str,
+    reference_species: str,
+    reference_taxid: str,
+    status: str,
+    message: str,
+) -> _SpeciesCheckRow:
+    return _SpeciesCheckRow(
+        sample_id=sample_id,
+        sample_species=sample_species or "-",
+        sample_taxid=sample_taxid or "-",
+        reference_species=reference_species or "-",
+        reference_taxid=reference_taxid or "-",
+        status=status,
+        message=message,
+    )
+
+
+def _metadata_value(metadata: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _normalize_species_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _manifest_metadata_by_run(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for row in manifest.get("metadata") or []:
+        if not isinstance(row, dict):
+            continue
+        accession = _metadata_value(row, "run", "Run", "accession").upper()
+        if accession:
+            rows[accession] = row
+    return rows
+
+
+def _merge_manifest_sra_metadata(manifest: dict[str, Any], records: list[SraRunMetadata]) -> bool:
+    existing = [row for row in manifest.get("metadata") or [] if isinstance(row, dict)]
+    by_run = {str(row.get("run") or row.get("Run") or row.get("accession") or "").strip().upper(): dict(row) for row in existing}
+    changed = False
+    for record in records:
+        accession = record.run.strip().upper()
+        if not accession:
+            continue
+        row = by_run.setdefault(accession, {"run": accession})
+        for key, value in asdict(record).items():
+            if key == "raw":
+                continue
+            if value not in (None, "") and row.get(key) != value:
+                row[key] = value
+                changed = True
+        size = _coerce_size_mb(record.size_mb)
+        if size and row.get("expected_size_bytes") != size:
+            row["expected_size_bytes"] = size
+            changed = True
+    if changed:
+        manifest["metadata"] = list(by_run.values())
+    return changed
+
+
+def _write_task_manifest_record(task: TaskWorkspace, data: dict[str, Any]) -> None:
+    manifest_path = task.metadata_dir / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _print_species_check_report(console: Console, report: _SpeciesCheckReport, asset: ReferenceAsset | None = None) -> None:
+    if asset is not None:
+        ref_table = Table(title="Reference 元数据")
+        ref_table.add_column("Field")
+        ref_table.add_column("Value")
+        ref_table.add_row("reference_id", asset.reference_id)
+        ref_table.add_row("species", str(asset.species or "-"))
+        ref_table.add_row("taxon_id", str(asset.taxon_id or "-"))
+        ref_table.add_row("assembly", str(asset.assembly or "-"))
+        ref_table.add_row("release", str(asset.release or "-"))
+        ref_table.add_row("provider", str(asset.provider or "-"))
+        ref_table.add_row("annotation_provider", str(asset.annotation_provider or "-"))
+        ref_table.add_row("FASTA", str(asset.fasta))
+        ref_table.add_row("GTF/GFF", str(asset.annotation or "-"))
+        ref_table.add_row("HISAT2 index", str(asset.hisat2_index))
+        ref_table.add_row("build_status", str(asset.build_status or "-"))
+        if asset.source_urls:
+            ref_table.add_row("source_urls", "\n".join(asset.source_urls[:6]))
+        console.print(ref_table)
+    table = Table(title="样本物种与 Reference 检查")
+    table.add_column("Sample")
+    table.add_column("Sample Organism")
+    table.add_column("Sample TaxID")
+    table.add_column("Reference Species")
+    table.add_column("Reference TaxID")
+    table.add_column("Status")
+    table.add_column("Message")
+    for row in report.rows:
+        style = "green" if row.status == "match" else "red" if row.status == "mismatch" else "yellow"
+        table.add_row(
+            row.sample_id,
+            row.sample_species,
+            row.sample_taxid,
+            row.reference_species,
+            row.reference_taxid,
+            f"[{style}]{row.status}[/{style}]",
+            row.message,
+        )
+    console.print(table)
+    if report.mismatches:
+        console.print("[bold red]检测到样本物种与 Reference 不一致。继续运行通常会导致极低比对率和大量 0 计数。[/bold red]")
+    elif report.unknowns:
+        console.print("[yellow]部分样本或 Reference 缺少物种/TaxID 元数据，无法完全判断。[/yellow]")
 
 
 def _prepare_workflow_inputs_from_manifest(task: TaskWorkspace, params: TaskParams) -> Path | list[Sample] | None:
@@ -1931,32 +2698,27 @@ def _load_manifest_expected_sizes(data: dict[str, Any], fetch_missing: bool = Fa
 
 
 def _enrich_manifest_expected_sizes(data: dict[str, Any]) -> bool:
+    return _enrich_manifest_sra_metadata(data)
+
+
+def _enrich_manifest_sra_metadata(data: dict[str, Any]) -> bool:
     accessions = [str(item).strip().upper() for item in data.get("accessions") or [] if str(item).strip()]
-    missing = [accession for accession in accessions if accession not in _load_manifest_expected_sizes(data)]
+    expected_sizes = _load_manifest_expected_sizes(data)
+    metadata_by_run = _manifest_metadata_by_run(data)
+    missing = [
+        accession
+        for accession in accessions
+        if accession not in expected_sizes
+        or not _metadata_value(metadata_by_run.get(accession, {}), "taxid", "TaxID", "taxon_id")
+        or not _metadata_value(metadata_by_run.get(accession, {}), "scientific_name", "ScientificName", "species", "organism")
+    ]
     if not missing:
         return False
     try:
-        from rnaseq_workflow.steps.download import fetch_sra_runinfo_rows
-
-        rows = fetch_sra_runinfo_rows(missing, timeout_seconds=8.0)
+        records = fetch_sra_metadata(missing, timeout_seconds=8.0)
     except Exception:
         return False
-    existing = [row for row in data.get("metadata") or [] if isinstance(row, dict)]
-    by_run = {str(row.get("run") or row.get("Run") or row.get("accession") or "").strip().upper(): row for row in existing}
-    changed = False
-    for row in rows:
-        accession = str(row.get("Run") or "").strip().upper()
-        size = _coerce_size_mb(row.get("size_MB"))
-        if not accession or not size:
-            continue
-        record = by_run.setdefault(accession, {"run": accession})
-        record["run"] = accession
-        record["size_MB"] = row.get("size_MB")
-        record["expected_size_bytes"] = size
-        changed = True
-    if changed:
-        data["metadata"] = list(by_run.values())
-    return changed
+    return _merge_manifest_sra_metadata(data, records)
 
 
 def _update_manifest_expected_sizes(path: Path, sizes: dict[str, int]) -> None:
@@ -2287,26 +3049,36 @@ def _params_to_run_config(params: TaskParams) -> dict:
         "featurecounts_attribute_type": params.featurecounts_attribute_type,
         "featurecounts_strandness": params.featurecounts_strandness,
         "featurecounts_paired": params.featurecounts_paired,
+        "stringtie_annotation": params.annotation,
+        "stringtie_threads": params.stringtie_threads,
+        "stringtie_estimate_only": True,
+        "stringtie_gene_abundance": True,
+        "expression_output_formats": params.expression_output_formats,
     }
     if params.disk_guard_strategy == "transfer":
         config["docker_extra_mounts"] = params.spill_paths
     return config
 
 
-def _finalize_completed_workflow(task: TaskWorkspace, output_dir: Path, samples: list[Sample]) -> tuple[FinalizeResult | None, str]:
+def _finalize_completed_workflow(
+    task: TaskWorkspace,
+    output_dir: Path,
+    samples: list[Sample],
+    output_formats: list[str] | None = None,
+) -> tuple[FinalizeResult | None, str]:
     readiness = _workflow_finalize_readiness(task, samples)
     if readiness:
         return None, readiness
     try:
-        result = finalize_project(
-            task.task_id,
-            output_dir,
-            samples,
-            counts_matrix=task.reports_dir / "count_matrix.tsv",
-            report_json=task.reports_dir / "report.json",
-            report_markdown=task.reports_dir / "report.md",
-            state_path=task.progress_path,
-        )
+        finalize_kwargs = {
+            "counts_matrix": task.reports_dir / "count_matrix.tsv",
+            "report_json": task.reports_dir / "report.json",
+            "report_markdown": task.reports_dir / "report.md",
+            "state_path": task.progress_path,
+        }
+        if output_formats is not None:
+            finalize_kwargs["output_formats"] = output_formats
+        result = finalize_project(task.task_id, output_dir, samples, **finalize_kwargs)
     except Exception as exc:
         return None, f"汇总失败: {type(exc).__name__}: {exc}"
     return result, "汇总完成"
@@ -2317,42 +3089,152 @@ def _workflow_finalize_readiness(task: TaskWorkspace, samples: list[Sample]) -> 
         data = json.loads(task.progress_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return "未执行汇总：进度文件不可读取。"
+    required_steps = ["featurecounts"]
+    try:
+        params = read_task_params(task.metadata_dir / "params.json")
+        required_steps = []
+        if any(item in {"raw_counts", "cpm", "fpkm", "tpm"} for item in params.expression_output_formats):
+            required_steps.append("featurecounts")
+        if _stringtie_outputs_enabled(params.expression_output_formats):
+            required_steps.append("stringtie")
+    except Exception:
+        pass
+    if not required_steps:
+        required_steps = ["featurecounts"]
     statuses: dict[str, str] = {}
     for sample in samples:
-        record = data.get("samples", {}).get(sample.sample_id, {}).get("steps", {}).get("featurecounts")
-        status = str(record.get("status") or "") if isinstance(record, dict) else ""
-        statuses[sample.sample_id] = status
-    incomplete = {sample_id: status or "PENDING" for sample_id, status in statuses.items() if status not in {StepStatus.COMPLETED.value, StepStatus.SKIPPED.value}}
+        sample_steps = data.get("samples", {}).get(sample.sample_id, {}).get("steps", {})
+        for step_id in required_steps:
+            record = sample_steps.get(step_id)
+            status = str(record.get("status") or "") if isinstance(record, dict) else ""
+            statuses[f"{sample.sample_id}:{step_id}"] = status
+    incomplete = {key: status or "PENDING" for key, status in statuses.items() if status not in {StepStatus.COMPLETED.value, StepStatus.SKIPPED.value}}
     if incomplete:
-        preview = ", ".join(f"{sample_id}={status}" for sample_id, status in sorted(incomplete.items())[:8])
-        suffix = f" 等 {len(incomplete)} 个样本" if len(incomplete) > 8 else ""
-        return f"未执行汇总：需等待全部样本 featureCounts 完成；未就绪 {preview}{suffix}。"
+        preview = ", ".join(f"{key}={status}" for key, status in sorted(incomplete.items())[:8])
+        suffix = f" 等 {len(incomplete)} 个步骤" if len(incomplete) > 8 else ""
+        return f"未执行汇总：需等待全部样本定量步骤完成；未就绪 {preview}{suffix}。"
     return ""
 
 
-def _print_workflow_run_summary(console: Console, summary, events, finalize_result: FinalizeResult | None = None, finalize_message: str = "") -> None:
+def _workflow_status_counts(task: TaskWorkspace, samples: list[Sample], steps: list[Any]) -> dict[str, int]:
+    total = len(samples) * len(steps)
+    counts = {
+        "total": total,
+        StepStatus.COMPLETED.value: 0,
+        StepStatus.SKIPPED.value: 0,
+        StepStatus.FAILED.value: 0,
+        StepStatus.CANCELLED.value: 0,
+        StepStatus.RUNNING.value: 0,
+        StepStatus.PENDING.value: 0,
+    }
+    try:
+        data = json.loads(task.progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        counts[StepStatus.PENDING.value] = total
+        return counts
+    for sample in samples:
+        sample_steps = data.get("samples", {}).get(sample.sample_id, {}).get("steps", {})
+        for step in steps:
+            record = sample_steps.get(step.step_id)
+            status = str(record.get("status") or StepStatus.PENDING.value) if isinstance(record, dict) else StepStatus.PENDING.value
+            if status not in counts:
+                counts[status] = 0
+            counts[status] += 1
+    return counts
+
+
+def _event_counts(events) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        key = f"{event.event}/{event.status.value}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _sample_final_event_rows(events) -> list[tuple[str, str, str, str, str]]:
+    latest: dict[str, Any] = {}
+    for event in events:
+        latest[event.sample_id] = event
+    rows = []
+    for sample_id, event in sorted(latest.items()):
+        rows.append((sample_id, event.step_id, event.event, event.status.value, event.message))
+    return rows
+
+
+def _print_workflow_run_summary(
+    console: Console,
+    summary,
+    events,
+    finalize_result: FinalizeResult | None = None,
+    finalize_message: str = "",
+    status_counts: dict[str, int] | None = None,
+) -> None:
     table = Table(title="Workflow Summary")
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("mode", summary.mode)
     table.add_row("samples", str(summary.sample_count))
-    table.add_row("steps", str(summary.step_count))
-    table.add_row("completed", str(summary.completed_events))
-    table.add_row("failed", str(summary.failed_events))
+    table.add_row("step_types", str(summary.step_count))
+    if status_counts:
+        completed = status_counts.get(StepStatus.COMPLETED.value, 0)
+        skipped = status_counts.get(StepStatus.SKIPPED.value, 0)
+        failed = status_counts.get(StepStatus.FAILED.value, 0)
+        cancelled = status_counts.get(StepStatus.CANCELLED.value, 0)
+        running = status_counts.get(StepStatus.RUNNING.value, 0)
+        pending = status_counts.get(StepStatus.PENDING.value, 0)
+        done = completed + skipped
+        table.add_row("sample_steps", str(status_counts.get("total", 0)))
+        table.add_row("done", f"{done}/{status_counts.get('total', 0)}")
+        table.add_row("completed", str(completed))
+        table.add_row("skipped", str(skipped))
+        table.add_row("failed", str(failed))
+        table.add_row("cancelled", str(cancelled))
+        table.add_row("running", str(running))
+        table.add_row("pending", str(pending))
+    else:
+        table.add_row("completed_events", str(summary.completed_events))
+        table.add_row("failed_events", str(summary.failed_events))
     if finalize_message:
         table.add_row("finalize", finalize_message)
     if finalize_result:
-        table.add_row("count_matrix", str(finalize_result.counts_matrix))
-        table.add_row("report_json", str(finalize_result.report_json))
-        table.add_row("report_markdown", str(finalize_result.report_markdown))
+        registry = _PathDisplayRegistry()
+        table.add_row("matrix_samples", str(finalize_result.sample_count))
+        table.add_row("matrix_genes", str(finalize_result.gene_count))
+        table.add_row("count_matrix", registry.inline(finalize_result.counts_matrix, as_file=True))
+        if finalize_result.expression_matrices:
+            for key, path in finalize_result.expression_matrices.items():
+                table.add_row(f"{key}_matrix", registry.inline(path, as_file=True))
+        table.add_row("report_json", registry.inline(finalize_result.report_json, as_file=True))
+        table.add_row("report_markdown", registry.inline(finalize_result.report_markdown, as_file=True))
     console.print(table)
-    event_table = Table(title="Recent Events")
+    if finalize_result and registry.text():
+        console.print(registry.text())
+    sample_rows = _sample_final_event_rows(events)
+    if sample_rows:
+        sample_table = Table(title="Sample Final Status")
+        sample_table.add_column("Sample")
+        sample_table.add_column("Last Step")
+        sample_table.add_column("Event")
+        sample_table.add_column("Status")
+        sample_table.add_column("Message")
+        for row in sample_rows:
+            sample_table.add_row(*row)
+        console.print(sample_table)
+    event_counts = _event_counts(events)
+    if event_counts:
+        count_table = Table(title="Step Event Counts")
+        count_table.add_column("Event/Status")
+        count_table.add_column("Count", justify="right")
+        for key, value in sorted(event_counts.items()):
+            count_table.add_row(key, str(value))
+        console.print(count_table)
+    event_table = Table(title="Recent Step Events (debug)")
     event_table.add_column("Sample")
     event_table.add_column("Step")
     event_table.add_column("Event")
     event_table.add_column("Status")
     event_table.add_column("Message")
-    for event in events[-20:]:
+    for event in events[-8:]:
         event_table.add_row(event.sample_id, event.step_id, event.event, event.status.value, event.message)
     console.print(event_table)
 
@@ -2360,13 +3242,22 @@ def _print_workflow_run_summary(console: Console, summary, events, finalize_resu
 def _workflow_finalize_display_text(finalize_result: FinalizeResult | None, finalize_message: str) -> str:
     if not finalize_result:
         return finalize_message
+    registry = _PathDisplayRegistry()
+    rows = [
+        finalize_message,
+        f"count_matrix: {registry.inline(finalize_result.counts_matrix, as_file=True)}",
+        *[
+            f"{key}_matrix: {registry.inline(path, as_file=True)}"
+            for key, path in (finalize_result.expression_matrices or {}).items()
+            if path != finalize_result.counts_matrix
+        ],
+        f"report_json: {registry.inline(finalize_result.report_json, as_file=True)}",
+        f"report_markdown: {registry.inline(finalize_result.report_markdown, as_file=True)}",
+    ]
+    if registry.text():
+        rows.extend(["", registry.text()])
     return "\n".join(
-        [
-            finalize_message,
-            f"count_matrix: {finalize_result.counts_matrix}",
-            f"report_json: {finalize_result.report_json}",
-            f"report_markdown: {finalize_result.report_markdown}",
-        ]
+        rows
     )
 
 
@@ -2645,6 +3536,7 @@ def _stage_batch_progress_text(
     note: str = "",
     system_text: str = "",
 ) -> str:
+    registry = _PathDisplayRegistry()
     total = max(1, len(samples) * len(steps))
     completed = sum(1 for value in statuses.values() if value == StepStatus.COMPLETED.value)
     failed = sum(1 for value in statuses.values() if value == StepStatus.FAILED.value)
@@ -2659,7 +3551,7 @@ def _stage_batch_progress_text(
     if system_text:
         lines.append(system_text)
     if note:
-        lines.append(f"提示: {note}")
+        lines.append(f"提示: {_compact_paths_in_text(note, registry)}")
     lines.append("")
     for sample in samples[:80]:
         row = []
@@ -2674,13 +3566,15 @@ def _stage_batch_progress_text(
         lines.append("")
         lines.append("最近信息:")
         for (sample_id, step_id), msg in recent_messages[-8:]:
-            lines.append(f"{sample_id}/{step_id}: {msg[:160]}")
+            lines.append(f"{sample_id}/{step_id}: {_compact_paths_in_text(msg[:160], registry)}")
     if done:
         lines.append("")
         lines.append(_run_done_message(cancelled=cancelled, failed=failed))
     else:
         lines.append("")
         lines.append("运行中。按 c 取消当前任务。")
+    if registry.text():
+        lines.extend(["", registry.text()])
     return "\n".join(lines)
 
 
@@ -2698,6 +3592,7 @@ def _sample_pipeline_progress_text(
     download_workers: int | None = None,
     system_text: str = "",
 ) -> str:
+    registry = _PathDisplayRegistry()
     total_units = max(1, len(samples) * len(steps))
     completed_units = 0.0
     running = failed = cancelled = 0
@@ -2738,6 +3633,7 @@ def _sample_pipeline_progress_text(
         )
         sample_percent = min(step_units / max(1, len(steps)) * 100.0, 100.0)
         stage_percent = _sample_current_stage_percent(sample, current_step, current_status, raw_detail, detail)
+        detail = _compact_paths_in_text(detail, registry)
         detail_text = f"  {detail}" if detail else ""
         sample_rows.append(
             f"{sample.sample_id}: 样本进度 {_text_progress_bar(sample_percent, width=18)} {sample_percent:.1f}%  "
@@ -2760,13 +3656,15 @@ def _sample_pipeline_progress_text(
     if download_summary:
         lines.append(download_summary)
     if note:
-        lines.append(f"提示: {note}")
+        lines.append(f"提示: {_compact_paths_in_text(note, registry)}")
     lines.append("")
     lines.extend(sample_rows)
     if len(samples) > 80:
         lines.append(f"... 还有 {len(samples) - 80} 个样本")
     lines.append("")
     lines.append(_run_done_message(cancelled=cancelled, failed=failed) if done else "运行中。按 c 取消当前任务。")
+    if registry.text():
+        lines.extend(["", registry.text()])
     return "\n".join(lines)
 
 
@@ -2843,6 +3741,7 @@ def _system_snapshot_for_params(params: TaskParams, task: TaskWorkspace | None, 
 
 
 def _compact_system_snapshot_text(snapshot: SystemSnapshot) -> str:
+    registry = _PathDisplayRegistry()
     cpu = "CPU: --"
     if snapshot.cpu.percent is not None:
         cpu = f"CPU: {snapshot.cpu.percent:.1f}%"
@@ -2856,28 +3755,36 @@ def _compact_system_snapshot_text(snapshot: SystemSnapshot) -> str:
         memory = f"内存: {snapshot.memory.percent:.1f}% {_format_bytes(snapshot.memory.used_bytes)}/{_format_bytes(snapshot.memory.total_bytes)}"
     disk = "工作盘: --"
     if snapshot.work_disk:
-        disk = _disk_status_text("工作盘", snapshot.work_disk)
-    spill = "  ".join(_disk_status_text("转移盘", item) for item in snapshot.spill_disks)
-    return "  ".join(part for part in [cpu, memory, disk, spill] if part)
+        disk = _disk_status_text("工作盘", snapshot.work_disk, registry)
+    spill = "  ".join(_disk_status_text("转移盘", item, registry) for item in snapshot.spill_disks)
+    line = "  ".join(part for part in [cpu, memory, disk, spill] if part)
+    return "\n".join([line, *registry.lines()])
 
 
-def _disk_status_text(label: str, disk: DiskSnapshot) -> str:
+def _disk_status_text(label: str, disk: DiskSnapshot, registry: _PathDisplayRegistry | None = None) -> str:
     state = {"ok": "OK", "warning": "WARN", "critical": "CRIT"}.get(disk.warning_level, disk.warning_level.upper())
-    return f"{label}: {state} {disk.percent:.1f}% used free={_format_bytes(disk.free_bytes)} path={disk.path}"
+    path_text = registry.inline(disk.path, as_file=False) if registry else str(disk.path)
+    return f"{label}: {state} {disk.percent:.1f}% used free={_format_bytes(disk.free_bytes)} path={path_text}"
 
 
 def _system_snapshot_text(snapshot: SystemSnapshot, params: TaskParams, task: TaskWorkspace | None, color: bool = True) -> str:
+    registry = _PathDisplayRegistry()
     lines = [
         _compact_system_snapshot_text(snapshot),
         "",
-        f"当前任务: {task.root if task else '未选择'}",
+        f"当前任务: {registry.inline(task.root, as_file=False) if task else '未选择'}",
         f"资源智能预警: {'开启' if params.resource_guard_enabled else '关闭'}",
         f"触发阈值: 剩余 <= {params.disk_guard_min_free_gb:g}GB 或 <= {params.disk_guard_min_free_percent:g}%",
         f"处理策略: {'取消并终止' if params.disk_guard_strategy == 'cancel' else '后续大产物写入转移路径'}",
     ]
     if params.disk_guard_strategy == "transfer":
         lines.append(f"大产物重定向: {'开启' if params.spill_large_outputs else '关闭'}")
-        lines.append("转移路径: " + ("; ".join(params.spill_paths) if params.spill_paths else "未配置"))
+        if params.spill_paths:
+            lines.append("转移路径: " + "; ".join(registry.inline(path, as_file=False) for path in params.spill_paths))
+        else:
+            lines.append("转移路径: 未配置")
+    if registry.text():
+        lines.extend(["", registry.text()])
     return "\n".join(lines)
 
 
@@ -3662,56 +4569,104 @@ def _edit_config_project_page(state: TuiState, data: dict[str, Any]) -> None:
     }
     if form["output_dir"]:
         form["output_mode"] = "custom"
+    index = 0
+    while True:
+        fields = _project_config_fields(form)
+        index = max(0, min(index, len(fields) - 1))
+        key, title, help_text = fields[index]
+        changed = _collect_project_config_field(
+            f"项目与目录 {index + 1}/{len(fields)}",
+            key,
+            title,
+            help_text,
+            form,
+            state,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
+        )
+        if changed == "back":
+            return
+        if changed == "prev":
+            index -= 1
+            continue
+        if changed != "ok":
+            continue
+        if key == "output_dir" and form.get("output_mode") == "custom" and not str(form.get("output_dir") or "").strip():
+            _message("需要补充", "请填写自定义输出目录。")
+            continue
+        if index < len(fields) - 1:
+            index += 1
+            continue
+        if not str(form.get("project_id") or "").strip():
+            _message("无法保存", "请先填写项目 ID。")
+            continue
+        data["project_id"] = str(form["project_id"]).strip()
+        data["asset_root"] = str(state.asset_root)
+        if state.user_id:
+            data["user_id"] = state.user_id
+        if state.task_id:
+            data["task_id"] = state.task_id
+        if form.get("output_mode") == "custom" and str(form.get("output_dir") or "").strip():
+            data["output_dir"] = str(form["output_dir"]).strip()
+        else:
+            data.pop("output_dir", None)
+        _write_config_data(state.config, data)
+        _message("已保存", "项目与目录配置已更新。")
+        return
+
+
+def _project_config_fields(form: dict[str, Any]) -> list[tuple[str, str, str]]:
     fields = [
         ("project_id", "项目 ID", "用于报告、日志和输出命名。"),
         ("output_mode", "输出目录方式", "自动使用任务目录；需要固定路径时选择自定义。"),
-        ("output_dir", "输出目录", "仅在选择自定义时填写。建议优先使用任务目录。"),
     ]
-    index = 0
-    while True:
-        key, title, help_text = fields[index]
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "保存"))
-        actions.append(("back", "返回"))
-        choice = _menu(
-            f"项目与目录 {index + 1}/{len(fields)}",
-            f"{title}\n当前: {_format_project_config_value(key, form.get(key))}\n\n{help_text}",
-            actions,
+    if form.get("output_mode") == "custom":
+        fields.append(("output_dir", "输出目录", "仅在选择自定义时填写。建议优先使用任务目录。"))
+    return fields
+
+
+def _collect_project_config_field(
+    page_title: str,
+    key: str,
+    title: str,
+    help_text: str,
+    data: dict[str, Any],
+    state: TuiState,
+    has_previous: bool = False,
+    is_last: bool = False,
+) -> str:
+    if key == "output_mode":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_project_config_value),
+            [("auto", "自动使用任务目录"), ("custom", "自定义输出目录")],
+            current_value=str(data.get(key) or "auto"),
+            has_previous=has_previous,
+            is_last=is_last,
         )
-        if choice in (None, "back"):
-            return
-        if choice == "prev":
-            index -= 1
-            continue
-        if choice == "next":
-            if key == "output_dir" and form.get("output_mode") == "custom" and not str(form.get("output_dir") or "").strip():
-                _message("需要补充", "请填写自定义输出目录。")
-                continue
-            index += 1
-            continue
-        if choice == "save":
-            if not str(form.get("project_id") or "").strip():
-                _message("无法保存", "请先填写项目 ID。")
-                continue
-            data["project_id"] = str(form["project_id"]).strip()
-            data["asset_root"] = str(state.asset_root)
-            if state.user_id:
-                data["user_id"] = state.user_id
-            if state.task_id:
-                data["task_id"] = state.task_id
-            if form.get("output_mode") == "custom" and str(form.get("output_dir") or "").strip():
-                data["output_dir"] = str(form["output_dir"]).strip()
-            else:
-                data.pop("output_dir", None)
-            _write_config_data(state.config, data)
-            _message("已保存", "项目与目录配置已更新。")
-            return
-        if choice == "edit":
-            _edit_project_config_field(key, form, state)
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value
+        if value == "auto":
+            data["output_dir"] = ""
+        return "ok"
+    if key == "output_dir":
+        default = data.get(key) or (state.task.task_output_dir if state.task else Path.cwd())
+        value = _path_input(title, default, directory=True)
+        if value is None:
+            return "prev" if has_previous else "back"
+        data[key] = str(value)
+        return "ok"
+    value = _tool_input_page(page_title, title, help_text, str(data.get(key) or ""), has_previous=has_previous)
+    if value == "__prev__":
+        return "prev"
+    if value is None:
+        return "back"
+    data[key] = value.strip()
+    return "ok"
 
 
 def _format_project_config_value(key: str, value: Any) -> str:
@@ -3771,39 +4726,92 @@ def _edit_config_execution_page(state: TuiState, data: dict[str, Any]) -> None:
     index = 0
     while True:
         key, title, help_text = fields[index]
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "保存"))
-        actions.append(("back", "返回"))
-        choice = _menu(
+        changed = _collect_execution_config_field(
             f"执行环境与并发 {index + 1}/{len(fields)}",
-            f"{title}\n当前: {_format_execution_config_value(key, form.get(key))}\n\n{help_text}",
-            actions,
+            key,
+            title,
+            help_text,
+            form,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
         )
-        if choice in (None, "back"):
+        if changed == "back":
             return
-        if choice == "prev":
+        if changed == "prev":
             index -= 1
             continue
-        if choice == "next":
-            if int(form.get(key) or 0) < 1 and key != "execution_mode":
-                _message("需要补充", f"{title} 必须大于 0。")
-                continue
+        if changed != "ok":
+            continue
+        if int(form.get(key) or 0) < 1 and key != "execution_mode":
+            _message("需要补充", f"{title} 必须大于 0。")
+            continue
+        if index < len(fields) - 1:
             index += 1
             continue
-        if choice == "save":
-            if int(form.get("max_workers") or 0) < 1:
-                _message("无法保存", "样本并发数必须大于 0。")
-                continue
-            data.update(form)
-            _write_config_data(state.config, data)
-            _message("已保存", "执行环境与并发配置已更新。")
-            return
-        if choice == "edit":
-            _edit_execution_config_field(key, form)
+        if int(form.get("max_workers") or 0) < 1:
+            _message("无法保存", "样本并发数必须大于 0。")
+            continue
+        data.update(form)
+        _write_config_data(state.config, data)
+        _message("已保存", "执行环境与并发配置已更新。")
+        return
+
+
+def _collect_execution_config_field(
+    page_title: str,
+    key: str,
+    title: str,
+    help_text: str,
+    data: dict[str, Any],
+    has_previous: bool = False,
+    is_last: bool = False,
+) -> str:
+    if key == "execution_mode":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_execution_config_value),
+            [("docker", "docker"), ("local", "local")],
+            current_value=str(data.get(key) or "docker"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value
+        return "ok"
+    if key == "docker_image":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_execution_config_value),
+            [("rnaseq-workflow:tools", "rnaseq-workflow:tools"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())],
+            current_value=str(data.get(key) or "rnaseq-workflow:tools"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入自定义 Docker 镜像名。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        return "ok"
+    value = _tool_input_page(page_title, title, help_text, str(data.get(key) or ""), has_previous=has_previous)
+    if value == "__prev__":
+        return "prev"
+    if value is None:
+        return "back"
+    data[key] = int(value.strip() or 0)
+    return "ok"
 
 
 def _format_execution_config_value(key: str, value: Any) -> str:
@@ -3859,36 +4867,66 @@ def _edit_config_reference_page(state: TuiState, data: dict[str, Any]) -> None:
     index = 0
     while True:
         key, title, help_text = fields[index]
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "保存"))
-        actions.append(("back", "返回"))
-        choice = _menu(
+        changed = _collect_reference_config_field(
             f"Reference 与注释 {index + 1}/{len(fields)}",
-            f"{title}\n当前: {_format_reference_config_value(key, form.get(key))}\n\n{help_text}",
-            actions,
+            key,
+            title,
+            help_text,
+            form,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
         )
-        if choice in (None, "back"):
+        if changed == "back":
             return
-        if choice == "prev":
+        if changed == "prev":
             index -= 1
             continue
-        if choice == "next":
+        if changed != "ok":
+            continue
+        if index < len(fields) - 1:
             index += 1
             continue
-        if choice == "save":
-            if not data.get("reference_id"):
-                _message("无法保存", "请先选择 reference。")
-                continue
-            data.update(form)
-            _write_config_data(state.config, data)
-            _message("已保存", "Reference 与注释配置已更新。")
-            return
-        if choice == "edit":
-            _edit_reference_config_field(key, form)
+        if not data.get("reference_id"):
+            _message("无法保存", "请先选择 reference。")
+            continue
+        data.update(form)
+        _write_config_data(state.config, data)
+        _message("已保存", "Reference 与注释配置已更新。")
+        return
+
+
+def _collect_reference_config_field(
+    page_title: str,
+    key: str,
+    title: str,
+    help_text: str,
+    data: dict[str, Any],
+    has_previous: bool = False,
+    is_last: bool = False,
+) -> str:
+    if key == "featurecounts_strandness":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_reference_config_value),
+            [("0", "0 非链特异"), ("1", "1 正向链特异"), ("2", "2 反向链特异")],
+            current_value=str(data.get(key) or 0),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = int(value)
+        return "ok"
+    value = _tool_input_page(page_title, title, help_text, str(data.get(key) or ""), has_previous=has_previous)
+    if value == "__prev__":
+        return "prev"
+    if value is None:
+        return "back"
+    data[key] = value.strip()
+    return "ok"
 
 
 def _format_reference_config_value(key: str, value: Any) -> str:
@@ -4134,7 +5172,9 @@ def _prepare_reference(reference_dir: Path, config: Path, state: TuiState | None
                 provider=provider,
                 annotation_provider=annotation_provider,
                 species=str(form["species"] or "") or None,
+                assembly=str(form["assembly"] or "") or None,
                 release=str(form["release"] or "") or None,
+                taxon_id=str(form["taxon_id"] or "") or _infer_taxid_for_species(str(form["species"] or "")) or None,
                 created_by=state.username if state and state.username else "download",
             ),
         )
@@ -4152,7 +5192,9 @@ def _prepare_reference_wizard() -> dict[str, Any] | None:
     data: dict[str, Any] = {
         "reference_id": "",
         "source_mode": "ensembl",
-        "species": "glycine_max",
+        "species": "",
+        "taxon_id": "",
+        "assembly": "",
         "division": "plants",
         "release": "current",
         "fasta_url": "",
@@ -4171,38 +5213,247 @@ def _prepare_reference_wizard() -> dict[str, Any] | None:
         fields = _prepare_reference_fields(data)
         index = max(0, min(index, len(fields) - 1))
         key, title, help_text = fields[index]
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "开始准备"))
-        actions.append(("back", "返回"))
-        choice = _menu(
+        changed = _collect_prepare_reference_field(
             f"准备 Reference {index + 1}/{len(fields)}",
-            f"{title}\n当前: {_format_prepare_reference_value(key, data.get(key))}\n\n{help_text}",
-            actions,
+            key,
+            title,
+            help_text,
+            data,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
         )
-        if choice in (None, "back"):
+        if changed == "back":
             return None
-        if choice == "prev":
+        if changed == "prev":
             index -= 1
             continue
-        if choice == "next":
-            valid, message = _validate_prepare_reference_field(key, data)
-            if not valid:
-                _message("需要补充", message)
-                continue
+        if changed != "ok":
+            continue
+        valid, message = _validate_prepare_reference_field(key, data)
+        if not valid:
+            _message("需要补充", message)
+            continue
+        if index < len(fields) - 1:
             index += 1
             continue
-        if choice == "save":
-            valid, message = _validate_prepare_reference(data)
-            if not valid:
-                _message("无法开始", message)
-                continue
-            return data
-        if choice == "edit":
-            _edit_prepare_reference_field(key, data)
+        valid, message = _validate_prepare_reference(data)
+        if not valid:
+            _message("无法开始", message)
+            continue
+        return data
+
+
+def _collect_prepare_reference_field(
+    page_title: str,
+    key: str,
+    title: str,
+    help_text: str,
+    data: dict[str, Any],
+    has_previous: bool = False,
+    is_last: bool = False,
+) -> str:
+    text = _field_page_text(data, key, help_text)
+    if key == "reference_id":
+        value = _tool_input_page(page_title, title, help_text, str(data[key]), has_previous=has_previous)
+        if value == "__prev__":
+            return "prev"
+        if value is None:
+            return "back"
+        data[key] = value.strip()
+        return "ok"
+    if key == "source_mode":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("ensembl", "Ensembl 自动获取"), ("url", "自定义 URL")],
+            current_value=str(data.get(key) or "ensembl"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value
+        if value == "ensembl" and data.get("provider") == "custom":
+            data["provider"] = "ensembl"
+            data["annotation_provider"] = "ensembl"
+        if value == "url" and data.get("provider") == "ensembl":
+            data["provider"] = "custom"
+            data["annotation_provider"] = "custom"
+        return "ok"
+    if key == "species":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [
+                ("", "请选择物种"),
+                ("glycine_max", "glycine_max（大豆）"),
+                ("arabidopsis_thaliana", "arabidopsis_thaliana（拟南芥）"),
+                ("homo_sapiens", "homo_sapiens"),
+                ("mus_musculus", "mus_musculus"),
+                ("__custom__", f"自定义: {data.get(key) or ''}".rstrip()),
+            ],
+            current_value=str(data.get(key) or ""),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入来源数据库接受的物种名，例如 arabidopsis_thaliana。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        if value and not str(data.get("taxon_id") or "").strip():
+            data["taxon_id"] = _infer_taxid_for_species(value)
+        return "ok"
+    if key == "division":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("plants", "plants"), ("vertebrates", "vertebrates"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())],
+            current_value=str(data.get(key) or "plants"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "可填 fungi、metazoa、protists 等。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        return "ok"
+    if key == "release":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("current", "current"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())],
+            current_value=str(data.get(key) or "current"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入版本号，例如 110。", str(data.get(key) or "current"), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        return "ok"
+    if key in {"provider", "annotation_provider"}:
+        provider = str(data.get("provider") or "custom")
+        options = [("ensembl", "ensembl"), ("refseq", "refseq"), ("custom", "custom"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())]
+        if key == "annotation_provider":
+            options.insert(0, ("same", f"同参考来源: {provider}"))
+        value = _tool_choice_page(page_title, title, text, options, current_value=str(data.get(key) or ""), has_previous=has_previous, is_last=is_last)
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "same":
+            value = provider
+        elif value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入自定义来源名。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        if key == "provider" and data.get("annotation_provider") in {"", "same"}:
+            data["annotation_provider"] = value
+        return "ok"
+    if key == "execution_mode":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("docker", "docker"), ("local", "local")],
+            current_value=str(data.get(key) or "docker"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value
+        return "ok"
+    if key == "docker_image":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("rnaseq-workflow:tools", "rnaseq-workflow:tools"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())],
+            current_value=str(data.get(key) or "rnaseq-workflow:tools"),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入自定义 Docker 镜像名。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        return "ok"
+    if key in {"build_index", "actual_run", "force"}:
+        value = _tool_choice_page(
+            page_title,
+            title,
+            text,
+            [("yes", "是"), ("no", "否")],
+            current_value="yes" if data.get(key) else "no",
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value == "yes"
+        return "ok"
+    if key == "threads":
+        value = _tool_input_page(page_title, title, help_text, str(data.get(key) or 4), has_previous=has_previous)
+        if value == "__prev__":
+            return "prev"
+        if value is None:
+            return "back"
+        data[key] = value.strip()
+        return "ok"
+    value = _tool_input_page(page_title, title, help_text, str(data.get(key) or ""), has_previous=has_previous)
+    if value == "__prev__":
+        return "prev"
+    if value is None:
+        return "back"
+    data[key] = value.strip()
+    return "ok"
 
 
 def _prepare_reference_fields(data: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -4213,7 +5464,7 @@ def _prepare_reference_fields(data: dict[str, Any]) -> list[tuple[str, str, str]
     if data.get("source_mode") == "ensembl":
         fields.extend(
             [
-                ("species", "物种名称", "使用 Ensembl 接受的物种名。大豆为 glycine_max。"),
+                ("species", "物种名称", "使用 Ensembl 接受的物种名；可从常用物种中选择，也可自定义。"),
                 ("division", "Ensembl 分库", "大豆等植物选择 plants；人、鼠等选择 vertebrates。"),
                 ("release", "Ensembl 版本", "current 使用当前发布版；需要复现时可指定版本号。"),
             ]
@@ -4227,6 +5478,8 @@ def _prepare_reference_fields(data: dict[str, Any]) -> list[tuple[str, str, str]
         )
     fields.extend(
         [
+            ("taxon_id", "TaxID", "NCBI Taxonomy ID。glycine_max 为 3847，Arabidopsis thaliana 为 3702；可留空。"),
+            ("assembly", "Assembly", "参考基因组版本/组装名，可留空。"),
             ("provider", "参考来源", "记录 FASTA 来源。用于追踪资产，不影响命令执行。"),
             ("annotation_provider", "注释来源", "通常与参考来源一致。混用不同来源可能导致基因 ID 不匹配。"),
             ("execution_mode", "执行方式", "Docker 使用容器工具；Local 使用本机工具。"),
@@ -4291,6 +5544,14 @@ def _edit_prepare_reference_field(key: str, data: dict[str, Any]) -> None:
         )
         if value is not None:
             data[key] = value
+    elif key == "taxon_id":
+        value = _input("TaxID", "NCBI Taxonomy ID；可留空。", str(data.get(key) or ""))
+        if value is not None:
+            data[key] = value.strip()
+    elif key == "assembly":
+        value = _input("Assembly", "参考基因组版本/组装名；可留空。", str(data.get(key) or ""))
+        if value is not None:
+            data[key] = value.strip()
     elif key in {"fasta_url", "annotation_url"}:
         title = "Genome FASTA URL" if key == "fasta_url" else "GTF/GFF URL"
         value = _input(title, "仅支持 http、https 或 ftp。", str(data.get(key) or ""))
@@ -4377,6 +5638,8 @@ def _prepare_reference_field_label(key: str) -> str:
         "species": "物种名称",
         "division": "Ensembl 分库",
         "release": "Ensembl 版本",
+        "taxon_id": "TaxID",
+        "assembly": "Assembly",
         "fasta_url": "Genome FASTA URL",
         "annotation_url": "GTF/GFF URL",
     }.get(key, key)
@@ -4407,6 +5670,10 @@ def _register_reference(reference_dir: Path, state: TuiState | None = None) -> N
             overwrite=bool(form["overwrite"]),
             provider=str(form["provider"]),
             annotation_provider=str(form["annotation_provider"]),
+            species=str(form.get("species") or "") or None,
+            assembly=str(form.get("assembly") or "") or None,
+            release=str(form.get("release") or "") or None,
+            taxon_id=str(form.get("taxon_id") or "") or _infer_taxid_for_species(str(form.get("species") or "")) or None,
             created_by=state.username if state and state.username else "manual",
             notes=str(form["description"]),
         )
@@ -4423,6 +5690,10 @@ def _register_reference_wizard() -> dict[str, Any] | None:
         "fasta": None,
         "annotation": None,
         "hisat2_index": None,
+        "species": "",
+        "taxon_id": "",
+        "assembly": "",
+        "release": "",
         "provider": "custom",
         "annotation_provider": "custom",
         "description": "",
@@ -4433,6 +5704,10 @@ def _register_reference_wizard() -> dict[str, Any] | None:
         ("fasta", "Genome FASTA", "HISAT2 建索引使用的基因组 FASTA 文件，必须存在。"),
         ("annotation", "GTF/GFF 注释", "featureCounts/StringTie 使用的注释文件；没有可跳过，但定量会受限。"),
         ("hisat2_index", "已有 HISAT2 index", "已有 index 时填写 prefix；不是 .ht2 单文件。没有可跳过，之后可构建。"),
+        ("species", "Reference 物种", "例如 glycine_max / Arabidopsis thaliana。用于运行前物种一致性判断。"),
+        ("taxon_id", "Reference TaxID", "NCBI Taxonomy ID；可留空。"),
+        ("assembly", "Assembly", "参考基因组版本/组装名；可留空。"),
+        ("release", "Release", "参考来源版本；可留空。"),
         ("provider", "参考来源", "记录 FASTA 来源，例如 custom、ensembl、refseq。"),
         ("annotation_provider", "注释来源", "通常与参考来源一致；混用 Ensembl 与 RefSeq 容易造成 ID 不一致。"),
         ("description", "描述", "记录物种、版本、来源或用途，方便以后复用。"),
@@ -4441,39 +5716,136 @@ def _register_reference_wizard() -> dict[str, Any] | None:
     index = 0
     while True:
         key, title, help_text = fields[index]
-        value = _format_register_reference_value(key, data.get(key))
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "保存登记"))
-        actions.append(("back", "返回"))
-        choice = _menu(
+        changed = _collect_register_reference_field(
             f"登记本地 Reference {index + 1}/{len(fields)}",
-            f"{title}\n当前: {value}\n\n{help_text}",
-            actions,
+            key,
+            title,
+            help_text,
+            data,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
         )
-        if choice in (None, "back"):
+        if changed == "back":
             return None
-        if choice == "prev":
+        if changed == "prev":
             index = max(0, index - 1)
             continue
-        if choice == "next":
-            valid, message = _validate_register_reference_progress(data, require_all=False)
-            if not valid and key in {"reference_id", "fasta"}:
-                _message("需要补充", message)
-                continue
+        if changed != "ok":
+            continue
+        valid, message = _validate_register_reference_progress(data, require_all=False)
+        if not valid and key in {"reference_id", "fasta"}:
+            _message("需要补充", message)
+            continue
+        if index < len(fields) - 1:
             index = min(len(fields) - 1, index + 1)
             continue
-        if choice == "save":
-            valid, message = _validate_register_reference_progress(data, require_all=True)
-            if not valid:
-                _message("无法保存", message)
-                continue
-            return data
-        if choice == "edit":
-            _edit_register_reference_field(key, data)
+        valid, message = _validate_register_reference_progress(data, require_all=True)
+        if not valid:
+            _message("无法保存", message)
+            continue
+        return data
+
+
+def _collect_register_reference_field(
+    page_title: str,
+    key: str,
+    title: str,
+    help_text: str,
+    data: dict[str, Any],
+    has_previous: bool = False,
+    is_last: bool = False,
+) -> str:
+    if key in {"fasta", "annotation", "hisat2_index"}:
+        value = _path_input(title if key != "hisat2_index" else "HISAT2 index prefix", data.get(key), must_exist=key != "hisat2_index")
+        if value is None:
+            return "prev" if has_previous else "back"
+        data[key] = value
+        return "ok"
+    if key == "species":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_register_reference_value),
+            [
+                ("glycine_max", "glycine_max（大豆）"),
+                ("arabidopsis_thaliana", "arabidopsis_thaliana（拟南芥）"),
+                ("homo_sapiens", "homo_sapiens"),
+                ("mus_musculus", "mus_musculus"),
+                ("__custom__", f"自定义: {data.get(key) or ''}".rstrip()),
+            ],
+            current_value=str(data.get(key) or ""),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入物种名。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        if not str(data.get("taxon_id") or "").strip():
+            data["taxon_id"] = _infer_taxid_for_species(value)
+        return "ok"
+    if key in {"provider", "annotation_provider"}:
+        provider = str(data.get("provider") or "custom")
+        options = [("custom", "custom"), ("ensembl", "ensembl"), ("refseq", "refseq"), ("__custom__", f"自定义: {data.get(key) or ''}".rstrip())]
+        if key == "annotation_provider":
+            options.insert(0, ("same", f"同参考来源: {provider}"))
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_register_reference_value),
+            options,
+            current_value=str(data.get(key) or ""),
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        if value == "same":
+            value = provider
+        elif value == "__custom__":
+            custom = _tool_input_page(page_title, title, "输入自定义来源名。", str(data.get(key) or ""), has_previous=has_previous)
+            if custom == "__prev__":
+                return "prev"
+            if custom is None:
+                return "back"
+            value = custom.strip()
+        data[key] = value
+        if key == "provider" and data.get("annotation_provider") in {"", "same"}:
+            data["annotation_provider"] = value
+        return "ok"
+    if key == "overwrite":
+        value = _tool_choice_page(
+            page_title,
+            title,
+            _field_page_text(data, key, help_text, formatter=_format_register_reference_value),
+            [("yes", "是"), ("no", "否")],
+            current_value="yes" if data.get(key) else "no",
+            has_previous=has_previous,
+            is_last=is_last,
+        )
+        if value is None:
+            return "back"
+        if value == "__prev__":
+            return "prev"
+        data[key] = value == "yes"
+        return "ok"
+    value = _tool_input_page(page_title, title, help_text, str(data.get(key) or ""), has_previous=has_previous)
+    if value == "__prev__":
+        return "prev"
+    if value is None:
+        return "back"
+    data[key] = value.strip()
+    return "ok"
 
 
 def _format_register_reference_value(key: str, value: Any) -> str:
@@ -4501,6 +5873,30 @@ def _edit_register_reference_field(key: str, data: dict[str, Any]) -> None:
         value = _path_input("HISAT2 index prefix", data.get(key), must_exist=False)
         if value is not None:
             data[key] = value
+    elif key == "species":
+        value = _choice_with_custom_input(
+            "Reference 物种",
+            "选择常用物种，或输入物种名。",
+            [("glycine_max", "glycine_max（大豆）"), ("arabidopsis_thaliana", "arabidopsis_thaliana"), ("homo_sapiens", "homo_sapiens"), ("mus_musculus", "mus_musculus")],
+            "输入物种名。",
+            str(data.get(key) or ""),
+        )
+        if value is not None:
+            data[key] = value
+            if not str(data.get("taxon_id") or "").strip():
+                data["taxon_id"] = _infer_taxid_for_species(value)
+    elif key == "taxon_id":
+        value = _input("Reference TaxID", "NCBI Taxonomy ID；可留空。", str(data.get(key) or ""))
+        if value is not None:
+            data[key] = value.strip()
+    elif key == "assembly":
+        value = _input("Assembly", "参考基因组版本/组装名；可留空。", str(data.get(key) or ""))
+        if value is not None:
+            data[key] = value.strip()
+    elif key == "release":
+        value = _input("Release", "参考来源版本；可留空。", str(data.get(key) or ""))
+        if value is not None:
+            data[key] = value.strip()
     elif key == "provider":
         value = _choice_with_custom_input(
             "参考来源",
@@ -4609,31 +6005,29 @@ def _build_reference_index_wizard() -> dict[str, Any] | None:
     index = 0
     while True:
         key, title, help_text = fields[index]
-        actions = [("edit", "编辑")]
-        if index > 0:
-            actions.append(("prev", "上一步"))
-        if index < len(fields) - 1:
-            actions.append(("next", "下一步"))
-        actions.append(("save", "开始构建"))
-        actions.append(("back", "返回"))
-        choice = _menu(
+        changed = _collect_prepare_reference_field(
             f"构建 HISAT2 index {index + 1}/{len(fields)}",
-            f"{title}\n当前: {_format_prepare_reference_value(key, data.get(key))}\n\n{help_text}",
-            actions,
+            key,
+            title,
+            help_text,
+            data,
+            has_previous=index > 0,
+            is_last=index == len(fields) - 1,
         )
-        if choice in (None, "back"):
+        if changed == "back":
             return None
-        if choice == "prev":
+        if changed == "prev":
             index -= 1
-        elif choice == "next":
+            continue
+        if changed != "ok":
+            continue
+        if index < len(fields) - 1:
             index += 1
-        elif choice == "save":
-            if int(data.get("threads") or 0) < 1:
-                _message("无法开始", "hisat2-build 线程数必须大于 0。")
-                continue
-            return data
-        elif choice == "edit":
-            _edit_build_reference_index_field(key, data)
+            continue
+        if int(data.get("threads") or 0) < 1:
+            _message("无法开始", "hisat2-build 线程数必须大于 0。")
+            continue
+        return data
 
 
 def _edit_build_reference_index_field(key: str, data: dict[str, Any]) -> None:
@@ -4803,6 +6197,69 @@ def _reference_index_activity(prefix: Path) -> str:
     size = sum(item.stat().st_size for item in files)
     latest = max(files, key=lambda item: item.stat().st_mtime)
     return f"{len(files)}/8 files {_format_bytes(size)} last={latest.name}"
+
+
+def _run_simple_task_with_tui_progress(title: str, description: str, worker: Callable[[], Any]) -> Any:
+    status_area = TextArea(
+        text=_simple_task_progress_text(title, description, "RUNNING", 0.0),
+        read_only=True,
+        scrollbar=True,
+        focusable=False,
+        wrap_lines=False,
+    )
+    kb = KeyBindings()
+    result_holder = {"result": None, "error": None, "done": False}
+    started_at = time.monotonic()
+
+    @kb.add("q")
+    def _quit_if_done(event) -> None:
+        if result_holder["done"]:
+            event.app.exit()
+
+    def run_worker() -> None:
+        try:
+            result_holder["result"] = worker()
+        except BaseException as exc:
+            result_holder["error"] = exc
+        finally:
+            result_holder["done"] = True
+
+    app = Application(
+        layout=Layout(
+            Box(
+                Frame(HSplit([status_area, Label(text=""), Label(text="任务完成后按 q 返回。")]), title=title),
+                padding=1,
+            )
+        ),
+        key_bindings=kb,
+        style=STYLE,
+        full_screen=True,
+    )
+
+    def refresher() -> None:
+        while not result_holder["done"]:
+            status_area.text = _simple_task_progress_text(title, description, "RUNNING", time.monotonic() - started_at)
+            app.invalidate()
+            time.sleep(0.3)
+        status = "FAILED" if result_holder["error"] else "COMPLETED"
+        status_area.text = _simple_task_progress_text(title, description, status, time.monotonic() - started_at, result_holder["error"])
+        app.invalidate()
+
+    threading.Thread(target=run_worker, daemon=True).start()
+    threading.Thread(target=refresher, daemon=True).start()
+    app.run()
+    if result_holder["error"]:
+        raise result_holder["error"]
+    return result_holder["result"]
+
+
+def _simple_task_progress_text(title: str, description: str, status: str, elapsed: float, error: BaseException | None = None) -> str:
+    lines = [title, f"状态: {status}", f"用时: {elapsed:.1f}s", "", description]
+    if error:
+        lines.extend(["", f"错误: {type(error).__name__}: {error}"])
+    if status != "RUNNING":
+        lines.extend(["", "任务已结束，按 q 返回。"])
+    return "\n".join(lines)
 
 
 def _use_reference(reference_dir: Path, config: Path) -> None:
@@ -5422,7 +6879,8 @@ def _collect_tool_run_field(
 ) -> str:
     page_title = f"{title} {index + 1}/{total}"
     current = _format_tool_run_value(kind, data.get(key), choices)
-    text = f"当前: {current}\n\n{help_text}"
+    label = "已填" if str(current or "").strip() and current != "未设置" else "默认/待填"
+    text = f"{label}: {current}\n\n{help_text}"
     if kind in {"choice", "choice_custom"}:
         menu_choices = list(choices)
         if kind == "choice_custom":
@@ -5471,6 +6929,16 @@ def _collect_tool_run_field(
             return "prev" if index > 0 else "back"
         data[key] = value
         return "ok"
+    if kind == "multiselect":
+        default_values = [str(item) for item in (data.get(key) or [])]
+        selected = _option_multiselect(field_title, help_text, list(choices), default_values=default_values)
+        if selected is None:
+            return "prev" if index > 0 else "back"
+        if not selected:
+            _message("需要补充", "请至少选择一项。")
+            return "retry"
+        data[key] = selected
+        return "ok"
     value = _tool_input_page(page_title, field_title, help_text, str(data.get(key) or ""), has_previous=index > 0)
     if value == "__prev__":
         return "prev"
@@ -5506,6 +6974,7 @@ def _tool_choice_page(
     dialog_width = max(64, min(92, max(get_cwidth(field_title) + 24, *[get_cwidth(label) + 18 for _value, label in values], 64)))
     menu_width = min(56, max([get_cwidth(label) for _value, label in values] + [20]) + 10)
     menu_indent = max(0, (dialog_width - menu_width - 6) // 2)
+    visible_options = 12
 
     def choose(index: int, event=None) -> None:
         selected["index"] = max(0, min(index, len(values) - 1))
@@ -5544,11 +7013,17 @@ def _tool_choice_page(
     def render_options():
         fragments: list[Any] = []
         fragments.append(("class:menu.border", f"{field_title}\n"))
-        current_line = str(text).splitlines()[0] if str(text).strip() else ""
+        text_lines = str(text).splitlines()
+        current_line = text_lines[0] if text_lines else ""
         if current_line:
-            fragments.append(("class:dialog.body", current_line + "\n"))
+            fragments.append(("class:dialog.body", _wrap_display_text(current_line, max(24, dialog_width - 12))[0] + "\n"))
         fragments.append(("", "\n"))
-        for index, (_value, label) in enumerate(values):
+        start = _scroll_window_start(len(values), selected["index"], visible_options)
+        end = min(len(values), start + visible_options)
+        if start:
+            fragments.append(("class:dialog.body", f"   ... 上方还有 {start} 项\n"))
+        for index in range(start, end):
+            _value, label = values[index]
             active = index == selected["index"]
             handler = option_mouse_handler(index)
             label_text = str(label)
@@ -5567,15 +7042,19 @@ def _tool_choice_page(
                 )
             else:
                 fragments.append(("class:menu", f"{indent}   {label_text}\n", handler))
+        if end < len(values):
+            fragments.append(("class:dialog.body", f"   ... 下方还有 {len(values) - end} 项\n"))
         _value, active_label = values[selected["index"]]
         fragments.append(("", "\n"))
         fragments.append(("class:menu.border", "说明: "))
-        hint = _menu_item_hint(active_label, fallback="\n".join(str(text).splitlines()[2:]))
+        hint = _menu_item_hint(active_label, fallback="\n".join(text_lines[2:]))
         hint_lines = _wrap_display_text(hint, max(24, dialog_width - 12))
         fragments.append(("class:dialog.body", hint_lines[0]))
         for line in hint_lines[1:]:
             fragments.append(("", "\n"))
             fragments.append(("class:dialog.body", "      " + line))
+        fragments.append(("", "\n"))
+        fragments.append(("class:dialog.body", "      ↑/↓ 选择，Ctrl+U/Ctrl+D 翻选项，PgUp 上一步。"))
         return FormattedText(fragments)
 
     def render_buttons():
@@ -5612,6 +7091,14 @@ def _tool_choice_page(
     @kb.add("left")
     def _up(event) -> None:
         move(-1, event)
+
+    @kb.add("c-d")
+    def _page_down(event) -> None:
+        move(visible_options, event)
+
+    @kb.add("c-u")
+    def _page_up(event) -> None:
+        move(-visible_options, event)
 
     @kb.add("escape")
     @kb.add("c-c")
@@ -6387,6 +7874,156 @@ def _sample_multiselect(title: str, samples: list[Sample]) -> list[Sample] | Non
     return selected_samples
 
 
+def _option_multiselect(
+    title: str,
+    text: str,
+    values: list[tuple[str, str]],
+    default_values: list[str] | None = None,
+) -> list[str] | None:
+    defaults = list(default_values or [])
+    if _use_line_dialogs():
+        return _line_multiselect(title, values, default_values=defaults)
+    return _keyboard_multiselect(title, text or "空格勾选或取消。", values, defaults)
+
+
+def _keyboard_multiselect(
+    title: str,
+    text: str,
+    values: list[tuple[str, str]],
+    default_values: list[str] | None = None,
+) -> list[str] | None:
+    selected_values = set(default_values or [])
+    selected = {"index": 0}
+    result: dict[str, list[str] | None] = {"value": None}
+    kb = KeyBindings()
+    dialog_width = max(64, min(96, max([get_cwidth(label) + 18 for _value, label in values] + [64])))
+    visible_options = 12
+
+    def move(delta: int, event=None) -> None:
+        if not values:
+            return
+        selected["index"] = (selected["index"] + delta) % len(values)
+        if event is not None:
+            event.app.invalidate()
+
+    def toggle(index: int, event=None) -> None:
+        if not values:
+            return
+        value = values[index][0]
+        if value in selected_values:
+            selected_values.remove(value)
+        else:
+            selected_values.add(value)
+        if event is not None:
+            event.app.invalidate()
+
+    def exit_with(value: list[str] | None, event=None) -> None:
+        result["value"] = value
+        if event is not None:
+            event.app.exit(result=value)
+
+    def option_mouse_handler(index: int):
+        def handle(mouse_event: MouseEvent) -> None:
+            if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                selected["index"] = index
+                toggle(index)
+                from prompt_toolkit.application.current import get_app
+
+                get_app().invalidate()
+
+        return handle
+
+    def button_mouse_handler(kind: str):
+        def handle(mouse_event: MouseEvent) -> None:
+            if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                from prompt_toolkit.application.current import get_app
+
+                value = [item for item, _label in values if item in selected_values] if kind == "accept" else None
+                result["value"] = value
+                get_app().exit(result=value)
+
+        return handle
+
+    def render_options():
+        fragments: list[Any] = []
+        for line in _wrap_display_text(str(text), max(24, dialog_width - 10)):
+            fragments.append(("class:dialog.body", line + "\n"))
+        fragments.append(("", "\n"))
+        start = _scroll_window_start(len(values), selected["index"], visible_options)
+        end = min(len(values), start + visible_options)
+        if start:
+            fragments.append(("class:dialog.body", f"... 上方还有 {start} 项\n"))
+        for index in range(start, end):
+            value, label = values[index]
+            active = index == selected["index"]
+            checked = "[x]" if value in selected_values else "[ ]"
+            prefix = " > " if active else "   "
+            style = "class:menu.selected" if active else "class:menu"
+            handler = option_mouse_handler(index)
+            fragments.append((style, f"{prefix}{checked} {label}\n", handler))
+        if end < len(values):
+            fragments.append(("class:dialog.body", f"... 下方还有 {len(values) - end} 项\n"))
+        fragments.append(("", "\n"))
+        fragments.append(("class:dialog.body", "Space 勾选/取消，Enter 确认，Esc 返回。"))
+        return FormattedText(fragments)
+
+    def render_buttons():
+        return FormattedText(
+            [
+                ("class:menu.border", "< 确认 Enter >", button_mouse_handler("accept")),
+                ("class:dialog.body", " "),
+                ("class:menu.border", "< 返回 Esc >", button_mouse_handler("cancel")),
+            ]
+        )
+
+    control = FormattedTextControl(render_options, focusable=True)
+    button_control = FormattedTextControl(render_buttons, focusable=False)
+
+    @kb.add("enter")
+    def _accept(event) -> None:
+        exit_with([item for item, _label in values if item in selected_values], event)
+
+    @kb.add(" ")
+    def _toggle(event) -> None:
+        toggle(selected["index"], event)
+
+    @kb.add("down")
+    def _down(event) -> None:
+        move(1, event)
+
+    @kb.add("up")
+    def _up(event) -> None:
+        move(-1, event)
+
+    @kb.add("pagedown")
+    def _page_down(event) -> None:
+        move(visible_options, event)
+
+    @kb.add("pageup")
+    def _page_up(event) -> None:
+        move(-visible_options, event)
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        exit_with(None, event)
+
+    dialog = Dialog(
+        title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
+        body=HSplit(
+            [
+                Window(content=control, always_hide_cursor=True, dont_extend_height=True),
+                Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
+            ],
+            padding=1,
+        ),
+        buttons=[],
+        width=Dimension(min=dialog_width, preferred=dialog_width, max=dialog_width),
+        with_background=True,
+    )
+    return Application(layout=Layout(dialog, focused_element=control), key_bindings=kb, style=STYLE, mouse_support=True, full_screen=True).run()
+
+
 def _sample_label(sample: Sample) -> str:
     extras = []
     if sample.metadata.get("scientific_name"):
@@ -6563,6 +8200,7 @@ def _step_progress_text(
     done: bool,
     elapsed: float = 0.0,
 ) -> str:
+    registry = _PathDisplayRegistry()
     completed = sum(1 for status in statuses.values() if status == StepStatus.COMPLETED.value)
     failed = sum(1 for status in statuses.values() if status == StepStatus.FAILED.value)
     cancelled = sum(1 for status in statuses.values() if status == StepStatus.CANCELLED.value)
@@ -6571,7 +8209,7 @@ def _step_progress_text(
         title,
         f"模式: {'dry-run' if context.dry_run else '实际运行'}",
         f"实时总并发: {max_workers}",
-        f"输出目录: {context.output_dir}",
+        f"输出目录: {registry.inline(context.output_dir, as_file=False)}",
         f"进度: completed={completed} failed={failed} cancelled={cancelled} running={running} total={len(samples)} elapsed={elapsed:.0f}s",
         "",
     ]
@@ -6586,6 +8224,8 @@ def _step_progress_text(
     if done:
         lines.append("")
         lines.append(_run_done_message(cancelled=cancelled, failed=failed))
+    if registry.text():
+        lines.extend(["", registry.text()])
     return "\n".join(lines)
 
 
@@ -6650,6 +8290,7 @@ def _paths_size(paths: list[Path]) -> int:
 
 
 def _print_step_results(console: Console, results: list[StepResult], title: str) -> None:
+    registry = _PathDisplayRegistry()
     table = Table(title=title)
     table.add_column("Sample")
     table.add_column("Status")
@@ -6667,10 +8308,12 @@ def _print_step_results(console: Console, results: list[StepResult], title: str)
             result.sample_id,
             f"[{status_style}]{result.status.value}[/{status_style}]",
             "" if result.return_code is None else str(result.return_code),
-            "; ".join(str(path) for path in result.outputs),
-            _tail(result.message, 800),
+            "; ".join(registry.inline(path) for path in result.outputs),
+            _compact_paths_in_text(_tail(result.message, 800), registry),
         )
     console.print(table)
+    if registry.text():
+        console.print(registry.text())
 
 
 def _tail(text: str, limit: int) -> str:
@@ -7080,6 +8723,59 @@ def _dialog_button_control(get_accept_value: Callable[[], str | None], accept_la
     return FormattedTextControl(render_buttons, focusable=False)
 
 
+def _scroll_window_start(total: int, selected: int, visible: int) -> int:
+    if total <= visible:
+        return 0
+    half = max(1, visible // 2)
+    start = selected - half
+    return max(0, min(start, total - visible))
+
+
+def _split_dialog_title_body(text: str) -> tuple[str, str]:
+    lines = str(text or "").splitlines()
+    if not lines:
+        return "", ""
+    title = lines[0].strip() or "确认"
+    body = "\n".join(lines[1:]).strip()
+    return title, body
+
+
+def _scrollable_text_dialog(title: str, text: str, ok_label: str = "确认 Enter") -> None:
+    text_area = TextArea(
+        text=str(text or ""),
+        read_only=True,
+        scrollbar=True,
+        wrap_lines=False,
+        width=Dimension(preferred=100),
+        height=Dimension(preferred=22),
+        focusable=True,
+        style="class:input",
+    )
+    button_control = _dialog_button_control(lambda: "ok", accept_label=ok_label)
+    dialog = Dialog(
+        title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
+        body=HSplit(
+            [
+                Frame(text_area, title=HTML("<ansicyan>内容</ansicyan>")),
+                Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
+            ],
+            padding=1,
+        ),
+        buttons=[],
+        width=Dimension(min=76, preferred=110, max=120),
+        with_background=True,
+    )
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _close(event) -> None:
+        event.app.exit(result=None)
+
+    Application(layout=Layout(dialog, focused_element=text_area), key_bindings=kb, style=STYLE, mouse_support=True, full_screen=True).run()
+
+
 def _int_input(
     title: str,
     default: int,
@@ -7107,6 +8803,7 @@ def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> b
         return _line_yes_no(title, default)
 
     result = {"value": None}
+    heading, body_text = _split_dialog_title_body(title)
 
     def exit_with(value: bool | None) -> None:
         from prompt_toolkit.application.current import get_app
@@ -7135,17 +8832,32 @@ def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> b
         )
 
     button_control = FormattedTextControl(render_buttons, focusable=False)
+    body_items: list[Any] = []
+    if body_text:
+        body_area = TextArea(
+            text=body_text,
+            read_only=True,
+            scrollbar=True,
+            wrap_lines=False,
+            height=Dimension(preferred=10),
+            focusable=True,
+            style="class:input",
+        )
+        body_items.append(Frame(body_area, title=HTML("<ansicyan>确认内容</ansicyan>")))
+        focused = body_area
+    else:
+        focused = None
+    body_items.extend(
+        [
+            Label(text=f"默认: {'是' if default else '否'}"),
+            Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
+        ]
+    )
     dialog = Dialog(
-        title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
-        body=HSplit(
-            [
-                Label(text=f"默认: {'是' if default else '否'}"),
-                Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
-            ],
-            padding=1,
-        ),
+        title=HTML(f"<b><ansicyan>{heading}</ansicyan></b>"),
+        body=HSplit(body_items, padding=1),
         buttons=[],
-        width=Dimension(min=54, preferred=64, max=72),
+        width=Dimension(min=54, preferred=78, max=100),
         with_background=True,
     )
 
@@ -7169,7 +8881,7 @@ def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> b
         exit_with(None)
 
     app = Application(
-        layout=Layout(dialog),
+        layout=Layout(dialog, focused_element=focused),
         key_bindings=kb,
         style=STYLE,
         mouse_support=True,
@@ -7193,12 +8905,7 @@ def _message(title: str, text: str) -> None:
     if _use_line_dialogs():
         _line_message(title, text)
         return
-    message_dialog(
-        title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
-        text=_dialog_text(text, include_multiselect=False),
-        ok_text="确认 Enter",
-        style=STYLE,
-    ).run()
+    _scrollable_text_dialog(title, text, ok_label="确认 Enter")
 
 
 def _show_recent_output(state: TuiState) -> None:
@@ -7385,6 +9092,9 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
     dialog_width = _menu_dialog_width(text, values)
     menu_width = _menu_list_width(values)
     menu_indent = max(0, (dialog_width - menu_width - 6) // 2)
+    visible_status_lines = 9
+    visible_options = 12
+    status_scroll = {"line": 0}
 
     def clamp() -> None:
         if values:
@@ -7418,8 +9128,28 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
         return handle
 
     def render_menu():
-        fragments = [("class:dialog.body", f"{status_text}\n\n" if status_text else "")]
-        for index, (_value, label) in enumerate(values):
+        fragments: list[Any] = []
+        if status_text:
+            status_lines = status_text.splitlines()
+            max_scroll = max(0, len(status_lines) - visible_status_lines)
+            status_scroll["line"] = max(0, min(status_scroll["line"], max_scroll))
+            start_line = status_scroll["line"]
+            end_line = min(len(status_lines), start_line + visible_status_lines)
+            if start_line:
+                fragments.append(("class:dialog.body", f"... 上方还有 {start_line} 行\n"))
+            for line in status_lines[start_line:end_line]:
+                wrapped = _wrap_display_text(line, max(24, dialog_width - 10)) or [""]
+                for wrapped_line in wrapped:
+                    fragments.append(("class:dialog.body", wrapped_line + "\n"))
+            if end_line < len(status_lines):
+                fragments.append(("class:dialog.body", f"... 下方还有 {len(status_lines) - end_line} 行\n"))
+            fragments.append(("", "\n"))
+        start = _scroll_window_start(len(values), selected["index"], visible_options)
+        end = min(len(values), start + visible_options)
+        if start:
+            fragments.append(("class:dialog.body", f"   ... 上方还有 {start} 项\n"))
+        for index in range(start, end):
+            _value, label = values[index]
             active = index == selected["index"]
             handle_click = mouse_handler(index)
             label_text = str(label)
@@ -7430,7 +9160,7 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
                     [
                         ("class:menu", indent, handle_click),
                         ("class:menu.border", " > ", handle_click),
-                        ("class:menu.marker", "* ", handle_click),
+                        ("class:menu.marker", "• ", handle_click),
                         ("class:menu.selected", label_text, handle_click),
                         ("class:menu", " " * label_padding, handle_click),
                         ("class:menu.border", " <\n", handle_click),
@@ -7438,6 +9168,8 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
                 )
             else:
                 fragments.append(("class:menu", f"{indent}   {label_text}\n", handle_click))
+        if end < len(values):
+            fragments.append(("class:dialog.body", f"   ... 下方还有 {len(values) - end} 项\n"))
         fragments.append(("", "\n"))
         fragments.append(("class:menu.border", "说明: "))
         hint_lines = _wrap_display_text(
@@ -7448,6 +9180,8 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
         for line in hint_lines[1:]:
             fragments.append(("", "\n"))
             fragments.append(("class:dialog.body", "      " + line))
+        fragments.append(("", "\n"))
+        fragments.append(("class:dialog.body", "      Enter 进入，PgUp/PgDn 翻选项，Ctrl+U/Ctrl+D 翻状态文本。"))
         return FormattedText(fragments)
 
     control = FormattedTextControl(render_menu, focusable=True)
@@ -7467,6 +9201,24 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
     @kb.add("up")
     def _up(event) -> None:
         move(-1, event)
+
+    @kb.add("pagedown")
+    def _page_down(event) -> None:
+        move(visible_options, event)
+
+    @kb.add("pageup")
+    def _page_up(event) -> None:
+        move(-visible_options, event)
+
+    @kb.add("c-d")
+    def _status_down(event) -> None:
+        status_scroll["line"] += visible_status_lines
+        event.app.invalidate()
+
+    @kb.add("c-u")
+    def _status_up(event) -> None:
+        status_scroll["line"] = max(0, status_scroll["line"] - visible_status_lines)
+        event.app.invalidate()
 
     @kb.add("escape")
     @kb.add("c-c")
@@ -7508,7 +9260,7 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
     def render_buttons():
         return FormattedText(
             [
-                ("class:menu.border", "< 确认 Enter >", button_mouse_handler("accept")),
+                ("class:menu.border", "< 进入 Enter >", button_mouse_handler("accept")),
                 ("class:dialog.body", " "),
                 ("class:menu.border", "< 返回 Esc >", button_mouse_handler("cancel")),
             ]
@@ -7535,7 +9287,7 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
             dialog,
             Window(char=" ", style="class:dialog"),
         ],
-        height=Dimension(min=18, preferred=26),
+        height=Dimension(min=18, preferred=32),
     )
     centered_layout = HSplit(
         [

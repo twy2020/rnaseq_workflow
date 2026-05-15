@@ -13,9 +13,9 @@ def test_build_pipeline_steps_expands_stages():
 
 
 def test_build_pipeline_steps_accepts_concrete_steps():
-    steps = build_pipeline_steps(["fastqc", "trim_galore"])
+    steps = build_pipeline_steps(["fastqc", "trim_galore", "stringtie"])
 
-    assert [step.step_id for step in steps] == ["fastqc", "trim_galore"]
+    assert [step.step_id for step in steps] == ["fastqc", "trim_galore", "stringtie"]
 
 
 def test_build_pipeline_steps_rejects_unknown_step():
