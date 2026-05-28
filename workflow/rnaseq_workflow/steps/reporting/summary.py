@@ -32,6 +32,7 @@ class StepStatusSummary:
     running: int = 0
     skipped: int = 0
     cancelled: int = 0
+    paused: int = 0
     pending: int = 0
 
 
@@ -45,6 +46,7 @@ class ProjectReport:
     counts_matrix: CountsMatrixSummary | None = None
     artifacts: list[ArtifactSummary] = field(default_factory=list)
     tool_versions: dict[str, str] = field(default_factory=dict)
+    quality_notes: list[dict[str, Any]] = field(default_factory=list)
     state_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -70,6 +72,7 @@ def summarize_progress_state(path: str | Path | None) -> tuple[int, StepStatusSu
         "running": 0,
         "skipped": 0,
         "cancelled": 0,
+        "paused": 0,
         "pending": 0,
     }
     for sample in samples.values():
@@ -80,6 +83,38 @@ def summarize_progress_state(path: str | Path | None) -> tuple[int, StepStatusSu
                 counts[status] += 1
 
     return len(samples), StepStatusSummary(**counts)
+
+
+def summarize_quality_notes(path: str | Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    state_path = Path(path)
+    if not state_path.exists():
+        return []
+    with state_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    notes: list[dict[str, Any]] = []
+    for sample_id, sample in data.get("samples", {}).items():
+        step = sample.get("steps", {}).get("fastqc_trimmed")
+        if not isinstance(step, dict):
+            continue
+        extra = step.get("extra", {}) if isinstance(step.get("extra"), dict) else {}
+        issues = extra.get("fastqc_issues") or []
+        status = str(step.get("status") or "")
+        if not issues and status != "PAUSED":
+            continue
+        notes.append(
+            {
+                "sample_id": sample_id,
+                "step_id": "fastqc_trimmed",
+                "status": status,
+                "message": step.get("message", ""),
+                "policy": extra.get("quality_policy"),
+                "issue_count": len(issues) if isinstance(issues, list) else 0,
+                "issues": issues if isinstance(issues, list) else [],
+            }
+        )
+    return notes
 
 
 def summarize_counts_matrix(path: str | Path | None) -> CountsMatrixSummary | None:
@@ -140,6 +175,7 @@ def build_project_report(
         counts_matrix=counts_matrix,
         artifacts=summarize_artifacts(artifact_paths or []),
         tool_versions=tool_versions or {},
+        quality_notes=summarize_quality_notes(state_path),
         state_path=str(state_path) if state_path is not None else None,
     )
 
@@ -171,6 +207,7 @@ def write_report_markdown(report: ProjectReport, output_path: str | Path) -> Non
         f"| Running | {report.step_status.running} |",
         f"| Skipped | {report.step_status.skipped} |",
         f"| Cancelled | {report.step_status.cancelled} |",
+        f"| Paused | {report.step_status.paused} |",
         f"| Pending | {report.step_status.pending} |",
         "",
     ]
@@ -193,6 +230,15 @@ def write_report_markdown(report: ProjectReport, output_path: str | Path) -> Non
         lines.extend(["## Tool Versions", "", "| Tool | Version |", "|---|---|"])
         for tool, version in report.tool_versions.items():
             lines.append(f"| {tool} | {version} |")
+        lines.append("")
+
+    if report.quality_notes:
+        lines.extend(["## Quality Notes", "", "| Sample | Step | Status | Policy | Issues | Message |", "|---|---|---|---|---:|---|"])
+        for note in report.quality_notes:
+            lines.append(
+                f"| {note.get('sample_id', '')} | {note.get('step_id', '')} | {note.get('status', '')} | "
+                f"{note.get('policy', '')} | {note.get('issue_count', 0)} | {note.get('message', '')} |"
+            )
         lines.append("")
 
     if report.artifacts:

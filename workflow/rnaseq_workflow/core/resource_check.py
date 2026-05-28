@@ -37,6 +37,7 @@ def run_resource_checks(
     docker_image: str = "rnaseq-workflow:tools",
     network_host: str = "www.ncbi.nlm.nih.gov",
     estimate: ResourceEstimate | None = None,
+    required_docker_tools: list[str] | None = None,
 ) -> list[ResourceCheck]:
     root = Path(workspace_dir)
     checks = [
@@ -48,6 +49,8 @@ def run_resource_checks(
     ]
     if shutil.which("docker"):
         checks.append(_command_check("docker image", ["docker", "image", "inspect", docker_image]))
+        for tool in required_docker_tools or []:
+            checks.append(_docker_tool_check(docker_image, tool))
     return checks
 
 
@@ -157,6 +160,41 @@ def _command_check(name: str, command: list[str]) -> ResourceCheck:
         return ResourceCheck(name, "error", False, message, "请检查工具安装、Docker 服务或镜像名称。")
     message = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else "ok"
     return ResourceCheck(name, "info", True, message, "工具可用。")
+
+
+def _docker_tool_check(docker_image: str, tool: str) -> ResourceCheck:
+    command = ["docker", "run", "--rm", docker_image, tool, "--version"]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return ResourceCheck(
+            f"docker tool:{tool}",
+            "error",
+            False,
+            "tool check timed out",
+            f"请检查 Docker 镜像 {docker_image} 是否可正常启动，并确认 {tool} 已安装。",
+        )
+    except OSError as exc:
+        return ResourceCheck(
+            f"docker tool:{tool}",
+            "error",
+            False,
+            str(exc),
+            "请检查 Docker 服务是否可用。",
+        )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+        if f'exec: "{tool}": executable file not found' in message or "executable file not found in $PATH" in message:
+            message = f"Docker 镜像缺少 {tool} 可执行文件"
+        return ResourceCheck(
+            f"docker tool:{tool}",
+            "error",
+            False,
+            message,
+            f"请重建镜像：docker build -f docker/Dockerfile.tools -t {docker_image} .",
+        )
+    message = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else "ok"
+    return ResourceCheck(f"docker tool:{tool}", "info", True, message, "容器内工具可用。")
 
 
 def _safe_size(path: Path) -> int:

@@ -26,6 +26,7 @@ from rnaseq_workflow.core.config_template import ConfigTemplateOptions, write_co
 from rnaseq_workflow.core.config_validation import validate_project_config
 from rnaseq_workflow.core.doctor import run_doctor_checks
 from rnaseq_workflow.core.finalize import finalize_project
+from rnaseq_workflow.core.logging import TaskLogManager
 from rnaseq_workflow.core.models import RunContext
 from rnaseq_workflow.core.pipeline import Pipeline
 from rnaseq_workflow.core.references import (
@@ -350,8 +351,18 @@ def _run_workflow_menu(console: Console, state: dict) -> None:
     print_run_start(console, cfg, samples, [step.step_id for step in steps], dry_run)
     context = RunContext(cfg.project_id, cfg.work_dir, cfg.output_dir, cfg.settings, dry_run=dry_run)
     repository = JsonStateRepository(cfg.output_dir / "progress.json")
-    executor = LocalExecutor(Pipeline(steps=steps, repository=repository), max_workers=_prompt_int(console, "样本并发数", 1, minimum=1))
-    run_executor_with_progress(console, executor, samples, context)
+    log_manager = TaskLogManager(cfg.output_dir, task_id=cfg.project_id)
+    log_manager.event("workflow_started", message="workflow started", dry_run=dry_run, sample_count=len(samples))
+    executor = LocalExecutor(
+        Pipeline(steps=steps, repository=repository, log_manager=log_manager),
+        max_workers=_prompt_int(console, "样本并发数", 1, minimum=1),
+    )
+    try:
+        run_executor_with_progress(console, executor, samples, context)
+    except BaseException as exc:
+        log_manager.event("workflow_cancelled", level="CRITICAL", message=str(exc))
+        raise
+    log_manager.event("workflow_completed", message="workflow completed", dry_run=dry_run)
     print_run_summary(console, cfg.output_dir / "progress.json")
     if _confirm(console, "生成最终 counts matrix 和报告", False):
         try:

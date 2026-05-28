@@ -9,6 +9,7 @@ from rnaseq_workflow.steps.reporting.summary import (
     summarize_artifacts,
     summarize_counts_matrix,
     summarize_progress_state,
+    summarize_quality_notes,
     write_report_json,
     write_report_markdown,
 )
@@ -104,3 +105,39 @@ def test_write_report_json_and_markdown(tmp_path):
     markdown = markdown_output.read_text(encoding="utf-8")
     assert "# RNA-seq Workflow Report: demo" in markdown
     assert "| featureCounts | 2.0.6 |" in markdown
+
+
+def test_report_includes_trimmed_fastqc_quality_notes(tmp_path):
+    state_path = tmp_path / "progress.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "samples": {
+                    "S1": {
+                        "steps": {
+                            "fastqc_trimmed": {
+                                "status": "PAUSED",
+                                "message": "manual review",
+                                "extra": {
+                                    "quality_policy": "pause_on_fail",
+                                    "fastqc_issues": [
+                                        {"file": "S1_fastqc.zip", "status": "FAIL", "module": "Adapter Content", "sequence": "S1"}
+                                    ],
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    notes = summarize_quality_notes(state_path)
+    report = build_project_report("demo", tmp_path, state_path=state_path)
+    markdown_output = tmp_path / "report.md"
+    write_report_markdown(report, markdown_output)
+
+    assert notes[0]["sample_id"] == "S1"
+    assert report.quality_notes[0]["issue_count"] == 1
+    assert "## Quality Notes" in markdown_output.read_text(encoding="utf-8")

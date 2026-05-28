@@ -19,6 +19,7 @@ class StepStatus(str, Enum):
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     CANCELLED = "CANCELLED"
+    PAUSED = "PAUSED"
 
 
 @dataclass(slots=True)
@@ -55,6 +56,7 @@ class StepResult:
     inputs: list[Path] = field(default_factory=list)
     outputs: list[Path] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+    log_file: str | None = None
 
     def to_record(self, step_name: str) -> "StepRecord":
         return StepRecord(
@@ -68,6 +70,7 @@ class StepResult:
             inputs=[str(path) for path in self.inputs],
             outputs=[str(path) for path in self.outputs],
             extra=self.extra,
+            log_file=self.log_file,
         )
 
 
@@ -85,3 +88,4 @@ class StepRecord:
     started_at: str | None = None
     finished_at: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    log_file: str | None = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,12 +25,14 @@ class FinalizeResult:
     sample_count: int
     gene_count: int
     expression_matrices: dict[str, Path] | None = None
+    hisat2_summary: Path | None = None
 
 
 def finalize_project(
     project_id: str,
     output_dir: str | Path,
     samples: list[Sample],
+    reports_dir: str | Path | None = None,
     counts_matrix: str | Path | None = None,
     report_json: str | Path | None = None,
     report_markdown: str | Path | None = None,
@@ -37,8 +40,8 @@ def finalize_project(
     output_formats: list[str] | None = None,
 ) -> FinalizeResult:
     paths = project_paths(Path(output_dir))
-    reports_dir = paths.reports_dir
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_root = Path(reports_dir) if reports_dir else paths.reports_dir
+    report_root.mkdir(parents=True, exist_ok=True)
 
     formats = normalize_expression_output_formats(output_formats)
     count_tables = _default_featurecounts_tables(paths.root, samples)
@@ -48,9 +51,10 @@ def finalize_project(
         missing_text = ", ".join(str(path) for path in missing)
         raise FileNotFoundError(f"featureCounts output not found: {missing_text}")
 
-    counts_matrix_path = Path(counts_matrix) if counts_matrix else reports_dir / "raw_counts.tsv"
-    report_json_path = Path(report_json) if report_json else reports_dir / "report.json"
-    report_markdown_path = Path(report_markdown) if report_markdown else reports_dir / "report.md"
+    counts_matrix_path = Path(counts_matrix) if counts_matrix else report_root / "raw_counts.tsv"
+    report_json_path = Path(report_json) if report_json else report_root / "report.json"
+    report_markdown_path = Path(report_markdown) if report_markdown else report_root / "report.md"
+    hisat2_summary_path = report_root / "hisat2_alignment_summary.tsv"
 
     matrix = merge_featurecounts_files(count_tables) if needs_featurecounts else None
     expression_matrices: dict[str, Path] = {}
@@ -63,7 +67,7 @@ def finalize_project(
         if method in formats:
             if matrix is None:
                 raise FileNotFoundError(f"featureCounts output not found for {method}")
-            output_path = reports_dir / f"{method}.tsv"
+            output_path = report_root / f"{method}.tsv"
             write_normalized_matrix_tsv(matrix, output_path, method)
             expression_matrices[method] = output_path
     for method in ("stringtie_fpkm", "stringtie_tpm"):
@@ -74,12 +78,14 @@ def finalize_project(
                 missing_text = ", ".join(str(path) for path in missing_stringtie)
                 raise FileNotFoundError(f"StringTie abundance output not found: {missing_text}")
             value = "fpkm" if method == "stringtie_fpkm" else "tpm"
-            output_path = reports_dir / f"{method}.tsv"
+            output_path = report_root / f"{method}.tsv"
             write_stringtie_matrix_tsv(merge_stringtie_abundance_files(abundance_tables, value=value), output_path)
             expression_matrices[method] = output_path
 
+    hisat2_rows = summarize_hisat2_logs(paths.root, samples)
+    write_hisat2_alignment_summary_tsv(hisat2_rows, hisat2_summary_path)
     primary_matrix = expression_matrices.get("raw_counts") or next(iter(expression_matrices.values()))
-    artifacts = [*expression_matrices.values(), *count_tables]
+    artifacts = [*expression_matrices.values(), hisat2_summary_path, *count_tables]
     report = build_project_report(
         project_id=project_id,
         output_dir=paths.root,
@@ -98,6 +104,7 @@ def finalize_project(
         sample_count=_matrix_sample_count(expression_matrices, matrix),
         gene_count=_matrix_gene_count(expression_matrices, matrix),
         expression_matrices=expression_matrices,
+        hisat2_summary=hisat2_summary_path,
     )
 
 
@@ -109,6 +116,86 @@ def _default_featurecounts_tables(output_dir: Path, samples: list[Sample]) -> li
 def _default_stringtie_abundance_tables(output_dir: Path, samples: list[Sample]) -> list[Path]:
     paths = project_paths(output_dir)
     return [paths.quantification_dir(sample) / f"{sample.sample_id}.stringtie.gene_abund.tsv" for sample in samples]
+
+
+@dataclass(frozen=True, slots=True)
+class Hisat2AlignmentSummary:
+    sample_id: str
+    total_reads: int | None
+    aligned_reads: int | None
+    alignment_rate: float | None
+    log_path: Path
+
+
+def summarize_hisat2_logs(output_dir: str | Path, samples: list[Sample]) -> list[Hisat2AlignmentSummary]:
+    paths = project_paths(Path(output_dir))
+    rows: list[Hisat2AlignmentSummary] = []
+    for sample in samples:
+        log_path = paths.alignment_dir(sample) / f"{sample.sample_id}.hisat2.log"
+        rows.append(parse_hisat2_summary_log(log_path, sample.sample_id))
+    return rows
+
+
+def parse_hisat2_summary_log(path: str | Path, sample_id: str) -> Hisat2AlignmentSummary:
+    log_path = Path(path)
+    if not log_path.exists():
+        return Hisat2AlignmentSummary(sample_id, None, None, None, log_path)
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    total_reads = _parse_hisat2_total_reads(text)
+    alignment_rate = _parse_hisat2_alignment_rate(text)
+    aligned_reads = _parse_hisat2_aligned_reads(text, total_reads)
+    return Hisat2AlignmentSummary(sample_id, total_reads, aligned_reads, alignment_rate, log_path)
+
+
+def write_hisat2_alignment_summary_tsv(rows: list[Hisat2AlignmentSummary], path: str | Path) -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["样本ID\t总reads数\t成功比对reads数\t比对率"]
+    for row in rows:
+        total = "" if row.total_reads is None else str(row.total_reads)
+        aligned = "" if row.aligned_reads is None else str(row.aligned_reads)
+        rate = "" if row.alignment_rate is None else f"{row.alignment_rate:.2f}%"
+        lines.append(f"{row.sample_id}\t{total}\t{aligned}\t{rate}")
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return output
+
+
+def _parse_hisat2_total_reads(text: str) -> int | None:
+    match = re.search(r"^\s*(\d+)\s+reads;\s+of these:", text, flags=re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def _parse_hisat2_alignment_rate(text: str) -> float | None:
+    match = re.search(r"^\s*([0-9]+(?:\.[0-9]+)?)%\s+overall alignment rate", text, flags=re.MULTILINE)
+    return float(match.group(1)) if match else None
+
+
+def _parse_hisat2_aligned_reads(text: str, total_reads: int | None) -> int | None:
+    # Single-end summary lines report read counts directly.
+    if " were unpaired; of these:" in text:
+        single_matches = [
+            int(value)
+            for value in re.findall(
+                r"^\s*(\d+)\s+\([^)]+\)\s+aligned\s+(?:0 times|exactly 1 time|>1 times)$",
+                text,
+                flags=re.MULTILINE,
+            )
+        ]
+        if single_matches:
+            return sum(single_matches[1:]) if len(single_matches) >= 3 else sum(single_matches)
+
+    if total_reads is not None:
+        aligned = _parse_pair_aligned_by_rate(text, total_reads)
+        if aligned is not None:
+            return aligned
+    return None
+
+
+def _parse_pair_aligned_by_rate(text: str, total_reads: int) -> int | None:
+    rate = _parse_hisat2_alignment_rate(text)
+    if rate is None:
+        return None
+    return round(total_reads * rate / 100)
 
 
 def normalize_expression_output_formats(formats: list[str] | None) -> list[str]:

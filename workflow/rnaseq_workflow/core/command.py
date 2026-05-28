@@ -4,11 +4,13 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
-from typing import TYPE_CHECKING, Callable, TextIO
+from typing import TYPE_CHECKING, Callable, Iterator, TextIO
 
 if TYPE_CHECKING:
     from rnaseq_workflow.core.models import RunContext
@@ -28,6 +30,9 @@ class CommandResult:
     @property
     def ok(self) -> bool:
         return self.return_code == 0
+
+
+_COMMAND_RESULTS: ContextVar[list[CommandResult] | None] = ContextVar("rnaseq_command_results", default=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +186,7 @@ def run_context_command(
         if cidfile is not None:
             docker_command[3:3] = ["--cidfile", str(cidfile)]
         try:
-            return run_command(
+            result = run_command(
                 docker_command,
                 cwd=cwd,
                 dry_run=context.dry_run,
@@ -190,13 +195,15 @@ def run_context_command(
                 completion_message=completion_message,
                 completion_callback=(lambda: _stop_docker_container_from_cidfile(cidfile)) if cidfile is not None else None,
             )
+            _record_context_command(result)
+            return result
         finally:
             if cidfile is not None:
                 try:
                     cidfile.unlink()
                 except OSError:
                     pass
-    return run_command(
+    result = run_command(
         command,
         cwd=cwd,
         dry_run=context.dry_run,
@@ -204,6 +211,24 @@ def run_context_command(
         completion_check=completion_check,
         completion_message=completion_message,
     )
+    _record_context_command(result)
+    return result
+
+
+@contextmanager
+def collect_context_commands() -> Iterator[list[CommandResult]]:
+    results: list[CommandResult] = []
+    token = _COMMAND_RESULTS.set(results)
+    try:
+        yield results
+    finally:
+        _COMMAND_RESULTS.reset(token)
+
+
+def _record_context_command(result: CommandResult) -> None:
+    results = _COMMAND_RESULTS.get()
+    if results is not None:
+        results.append(result)
 
 
 def build_docker_command(

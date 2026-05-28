@@ -72,7 +72,7 @@ class StringTieStep:
         command = build_stringtie_command(bam_path, annotation_path, output_gtf, abundance_path, options)
         result = run_context_command(command, context)
         status = StepStatus.COMPLETED if result.ok else StepStatus.FAILED
-        message = "StringTie completed" if result.ok else result.stderr
+        message = "StringTie completed" if result.ok else _stringtie_failure_message(result.stderr)
         return StepResult(
             sample_id=sample.sample_id,
             step_id=self.step_id,
@@ -98,3 +98,9 @@ def _bam_path(sample: Sample, context: RunContext) -> Path:
     if sample.source_path and str(sample.source_path).lower().endswith(".bam"):
         return Path(sample.source_path)
     return project_paths(context.output_dir).alignment_dir(sample) / f"{sample.sample_id}.sorted.bam"
+
+
+def _stringtie_failure_message(stderr: str) -> str:
+    if 'exec: "stringtie": executable file not found' in stderr or "executable file not found in $PATH" in stderr:
+        return "Docker 镜像缺少 stringtie 可执行文件；请重建 rnaseq-workflow:tools 镜像后重新运行。"
+    return stderr

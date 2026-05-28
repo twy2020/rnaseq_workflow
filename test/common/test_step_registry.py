@@ -12,10 +12,16 @@ def test_build_pipeline_steps_expands_stages():
     assert [step.step_id for step in steps] == ["fastqc", "hisat2", "samtools_sort", "featurecounts"]
 
 
-def test_build_pipeline_steps_accepts_concrete_steps():
-    steps = build_pipeline_steps(["fastqc", "trim_galore", "stringtie"])
+def test_default_pipeline_includes_trimmed_fastqc():
+    steps = build_pipeline_steps(None)
 
-    assert [step.step_id for step in steps] == ["fastqc", "trim_galore", "stringtie"]
+    assert [step.step_id for step in steps] == ["fastqc", "trim_galore", "fastqc_trimmed", "hisat2", "samtools_sort", "featurecounts"]
+
+
+def test_build_pipeline_steps_accepts_concrete_steps():
+    steps = build_pipeline_steps(["fastqc", "trim_galore", "fastqc_trimmed", "stringtie"])
+
+    assert [step.step_id for step in steps] == ["fastqc", "trim_galore", "fastqc_trimmed", "stringtie"]
 
 
 def test_build_pipeline_steps_rejects_unknown_step():

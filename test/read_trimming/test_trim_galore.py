@@ -111,6 +111,9 @@ def test_trim_galore_step_skips_done_output(tmp_path):
     sample.source_path.write_text("", encoding="utf-8")
     context = RunContext(project_id="demo", work_dir=tmp_path, output_dir=tmp_path / "output", dry_run=False)
     output_dir = tmp_path / "output" / "samples" / "S1" / "trimmed_fastq"
+    trimmed = output_dir / "S1_trimmed.fq.gz"
+    trimmed.parent.mkdir(parents=True)
+    trimmed.write_text("reads", encoding="utf-8")
     write_done_marker(
         output_dir,
         StepResult(sample_id="S1", step_id="trim_galore", status=StepStatus.COMPLETED, return_code=0, message="done"),
@@ -119,6 +122,8 @@ def test_trim_galore_step_skips_done_output(tmp_path):
     result = TrimGaloreStep().run(sample, context)
 
     assert result.status == StepStatus.SKIPPED
+    assert sample.source_paths == [trimmed]
+    assert sample.metadata["trimmed_fastq_dir"] == str(output_dir)
 
 
 def test_trim_galore_step_cleans_failed_output(tmp_path):
@@ -186,3 +191,35 @@ def test_trim_galore_step_recovers_complete_output_with_stale_lock(tmp_path):
     assert result.status == StepStatus.COMPLETED
     assert (output_dir / ".done.json").exists()
     assert not (output_dir / ".lock").exists()
+
+
+def test_trim_galore_success_attaches_trimmed_fastqs(tmp_path, monkeypatch):
+    sample = Sample(sample_id="S1", source_path=tmp_path / "S1.fastq.gz", layout=SampleLayout.SINGLE)
+    sample.source_path.write_text("@r\nA\n+\n!\n", encoding="utf-8")
+    context = RunContext(project_id="demo", work_dir=tmp_path, output_dir=tmp_path / "output", dry_run=False)
+    output_dir = tmp_path / "output" / "samples" / "S1" / "trimmed_fastq"
+
+    from rnaseq_workflow.core.command import CommandResult
+    from rnaseq_workflow.steps.read_trimming import trim_galore as module
+
+    def fake_run_context_command(command, context, cwd=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "S1_trimmed.fq.gz").write_text("reads", encoding="utf-8")
+        (output_dir / "S1.fastq.gz_trimming_report.txt").write_text("report", encoding="utf-8")
+        return CommandResult(
+            command=command,
+            return_code=0,
+            stdout="",
+            stderr="",
+            started_at="2026-01-01T00:00:00",
+            finished_at="2026-01-01T00:00:01",
+            duration_seconds=1.0,
+        )
+
+    monkeypatch.setattr(module, "run_context_command", fake_run_context_command)
+
+    result = TrimGaloreStep().run(sample, context)
+
+    assert result.status == StepStatus.COMPLETED
+    assert sample.source_paths == [output_dir / "S1_trimmed.fq.gz"]
+    assert sample.metadata["trimmed_fastq_dir"] == str(output_dir)

@@ -53,6 +53,21 @@ def test_tools_menu_contains_single_step_entries(monkeypatch):
     assert "report" in captured["values"]
 
 
+def test_task_management_menu_contains_log_center(monkeypatch, tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+
+    task = tui.build_asset_workspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    state = tui.TuiState(config=tmp_path / "config.yaml", console=Console(), asset_root=tmp_path / "workspace", user_id="user-1", task_id=task.task_id)
+    captured = {}
+    monkeypatch.setattr(tui, "_menu", lambda title, text, values: captured.setdefault("values", [value for value, _ in values]) and "back")
+
+    tui._task_management_menu(state)
+
+    assert "logs" in captured["values"]
+
+
 def test_tui_path_input_helper_can_be_patched(monkeypatch):
     from rnaseq_workflow.cli import tui
 
@@ -201,6 +216,41 @@ def test_create_task_sets_current_task(monkeypatch, tmp_path):
     assert task.root.parent == tmp_path / "workspace" / "users" / "user-1" / "tasks"
     assert task.read_metadata().task_name == "demo task"
     assert state.workspace.database.list_tasks("user-1")[0].task_id == task.task_id
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "task_created"
+    assert events[-1]["task_name"] == "demo task"
+    assert (task.logs_dir / "tui.log").exists()
+
+
+def test_create_task_back_on_name_does_not_create(monkeypatch, tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+
+    monkeypatch.setattr(tui, "_input", lambda title, text, default="": None if title == "任务名称" else "user-1")
+    monkeypatch.setattr(tui, "_menu", lambda title, text, values: "temp")
+    monkeypatch.setattr(tui, "_message", lambda title, text: None)
+    state = tui.TuiState(config=tmp_path / "config.yaml", console=Console(), asset_root=tmp_path / "workspace")
+
+    assert tui._create_task(state) is None
+    assert state.task_id is None
+    assert state.workspace.database.list_tasks("user-1") == []
+
+
+def test_create_task_back_on_description_does_not_create(monkeypatch, tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+
+    answers = iter(["demo task", None])
+    monkeypatch.setattr(tui, "_input", lambda title, text, default="": "user-1" if title == "user UUID" else next(answers))
+    monkeypatch.setattr(tui, "_menu", lambda title, text, values: "temp")
+    monkeypatch.setattr(tui, "_message", lambda title, text: None)
+    state = tui.TuiState(config=tmp_path / "config.yaml", console=Console(), asset_root=tmp_path / "workspace")
+
+    assert tui._create_task(state) is None
+    assert state.task_id is None
+    assert state.workspace.database.list_tasks("user-1") == []
 
 
 def test_workflow_manifest_page_writes_metadata(monkeypatch, tmp_path):
@@ -225,6 +275,9 @@ def test_workflow_manifest_page_writes_metadata(monkeypatch, tmp_path):
 
     assert (task.metadata_dir / "manifest.json").exists()
     assert "SRR000001" in (task.metadata_dir / "manifest.json").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "manifest_submitted"
+    assert events[-1]["accessions"] == 2
 
 
 def test_workflow_manifest_page_reuses_existing_raw(monkeypatch, tmp_path):
@@ -282,6 +335,10 @@ def test_workflow_manifest_page_records_local_files(monkeypatch, tmp_path):
 
     data = __import__("json").loads((task.metadata_dir / "manifest.json").read_text(encoding="utf-8"))
     assert data["local_files"][0]["path"] == str(fastq)
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "manifest_submitted"
+    assert events[-1]["mode"] == "local"
+    assert events[-1]["local_files"] == 1
 
 
 def test_prepare_workflow_inputs_uses_local_manifest_without_copy(monkeypatch, tmp_path):
@@ -424,6 +481,10 @@ def test_task_artifact_targets_and_cleanup(tmp_path):
     assert task.samples_dir.exists()
     assert not any(task.downloads_dir.rglob("*.*"))
     assert (task.reports_dir / "report.json").exists()
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "artifact_cleaned"
+    assert events[-1]["removed_bytes"] == 6
+    assert {target["key"] for target in events[-1]["targets"]} == {"downloads", "samples"}
 
 
 def test_task_artifact_targets_include_registered_external_outputs(tmp_path):
@@ -448,6 +509,9 @@ def test_task_artifact_targets_include_registered_external_outputs(tmp_path):
     assert removed == 8
     assert external_samples.exists()
     assert not any(external_samples.rglob("*.*"))
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "artifact_cleaned"
+    assert events[-1]["targets"][0]["external"] is True
 
 
 def test_task_artifact_stats_compacts_long_paths(capsys, tmp_path):
@@ -483,6 +547,108 @@ def test_task_artifact_cleanup_rejects_unregistered_external_path(tmp_path):
     assert outside.exists()
 
 
+def test_log_center_helpers_read_failures_and_export_zip(tmp_path):
+    import zipfile
+
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    manager = tui.TaskLogManager(task.root, task_id=task.task_id, user_id=task.user_id)
+    manager.event("workflow_started", message="start")
+    manager.command(command=["tool", "run"], sample_id="S1", step_id="hisat2", return_code=2, status="FAILED", command_id="cmd-1")
+    manager.download(accession="SRR1", status="RUNNING", downloaded_bytes=512)
+    failed_log = task.logs_dir / "samples" / "S1" / "hisat2.log"
+    failed_log.parent.mkdir(parents=True)
+    failed_log.write_text("[stderr]\nfailed hard\n", encoding="utf-8")
+    task.progress_path.write_text(
+        json.dumps(
+            {
+                "samples": {
+                    "S1": {
+                        "steps": {
+                            "hisat2": {
+                                "sample_id": "S1",
+                                "step_id": "hisat2",
+                                "status": "FAILED",
+                                "log_file": "logs/samples/S1/hisat2.log",
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert tui._line_count(task.logs_dir / "events.jsonl") == 1
+    assert tui._read_jsonl_tail(task.logs_dir / "commands.jsonl")[0]["command_id"] == "cmd-1"
+    assert tui._failed_step_log_paths(task) == [failed_log]
+
+    archive = tui._export_task_log_package(task)
+
+    assert archive.exists()
+    with zipfile.ZipFile(archive) as handle:
+        names = set(handle.namelist())
+    assert "events.jsonl" in names
+    assert "commands.jsonl" in names
+    assert "samples/S1/hisat2.log" in names
+    assert "metadata/progress.json" in names
+
+
+def test_archive_success_step_logs_keeps_failed_logs(tmp_path):
+    import zipfile
+
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    ok_log = task.logs_dir / "samples" / "S1" / "fastqc.log"
+    failed_log = task.logs_dir / "samples" / "S1" / "hisat2.log"
+    ok_log.parent.mkdir(parents=True)
+    ok_log.write_text("ok", encoding="utf-8")
+    failed_log.write_text("failed", encoding="utf-8")
+    task.progress_path.write_text(
+        json.dumps(
+            {
+                "samples": {
+                    "S1": {
+                        "steps": {
+                            "fastqc": {"status": "COMPLETED", "log_file": "logs/samples/S1/fastqc.log"},
+                            "hisat2": {"status": "FAILED", "log_file": "logs/samples/S1/hisat2.log"},
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    archive, removed = tui._archive_success_step_logs(task)
+
+    assert removed == 1
+    assert archive.exists()
+    assert not ok_log.exists()
+    assert failed_log.exists()
+    with zipfile.ZipFile(archive) as handle:
+        assert "samples/S1/fastqc.log" in handle.namelist()
+
+
+def test_print_jsonl_records_outputs_table(capsys, tmp_path):
+    from rich.console import Console
+
+    from rnaseq_workflow.cli import tui
+
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"time": "t1", "event": "workflow_started", "message": "hello"}\n', encoding="utf-8")
+
+    tui._print_jsonl_records(Console(force_terminal=False), "任务事件", path)
+    text = capsys.readouterr().out
+
+    assert "workflow_started" in text
+    assert "hello" in text
+
+
 def test_compact_paths_in_text_uses_work_dir_registry(tmp_path):
     from rnaseq_workflow.cli import tui
 
@@ -509,7 +675,11 @@ def test_workflow_resource_check_writes_metadata(monkeypatch, tmp_path):
         user_id="user-1",
         task_id=task.task_id,
     )
-    monkeypatch.setattr(tui, "run_resource_checks", lambda root, docker_image, estimate=None: [ResourceCheck("disk", "info", True, "ok")])
+    monkeypatch.setattr(
+        tui,
+        "run_resource_checks",
+        lambda root, docker_image, estimate=None, required_docker_tools=None: [ResourceCheck("disk", "info", True, "ok")],
+    )
     monkeypatch.setattr(tui, "_capture_output", lambda state, render, title: "")
 
     tui._workflow_resource_check_page(state)
@@ -547,7 +717,11 @@ def test_workflow_resource_check_counts_local_manifest(monkeypatch, tmp_path):
         task_id=task.task_id,
     )
     seen = []
-    monkeypatch.setattr(tui, "run_resource_checks", lambda root, docker_image, estimate=None: seen.append(estimate) or [ResourceCheck("disk", "info", True, "ok")])
+    monkeypatch.setattr(
+        tui,
+        "run_resource_checks",
+        lambda root, docker_image, estimate=None, required_docker_tools=None: seen.append(estimate) or [ResourceCheck("disk", "info", True, "ok")],
+    )
     monkeypatch.setattr(tui, "_capture_output", lambda state, render, title: "")
 
     tui._workflow_resource_check_page(state)
@@ -1379,6 +1553,9 @@ def test_workflow_processing_output_dir_builds_backup_root(tmp_path):
     assert records[0]["original_path"] == str(task.task_output_dir / "samples")
     assert records[0]["current_path"] == str(expected / "samples")
     assert records[0]["reason"] == "large_outputs_root"
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "artifact_moved"
+    assert events[-1]["reason"] == "large_outputs_root"
 
 
 def test_runtime_guard_switches_future_outputs_to_backup_root(monkeypatch, tmp_path):
@@ -1410,6 +1587,40 @@ def test_runtime_guard_switches_future_outputs_to_backup_root(monkeypatch, tmp_p
     assert sample.metadata["_workflow_output_dir"] == str(expected)
     assert "后续大产物" in note
     assert not guard.cancel_token.is_cancelled()
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    event_names = [event["event"] for event in events]
+    assert "disk_guard_triggered" in event_names
+    assert "artifact_moved" in event_names
+
+
+def test_runtime_guard_writes_resource_log(monkeypatch, tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.cancellation import CancellationToken
+    from rnaseq_workflow.core.system_monitor import CpuSnapshot, DiskSnapshot, MemorySnapshot, SystemSnapshot
+    from rnaseq_workflow.core.task_params import TaskParams
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    params = TaskParams(resource_guard_enabled=True, disk_guard_min_free_gb=0, disk_guard_min_free_percent=0)
+    snapshot = SystemSnapshot(
+        captured_at=123.0,
+        cpu=CpuSnapshot(percent=12.5),
+        memory=MemorySnapshot(total_bytes=1000, used_bytes=400, available_bytes=600, percent=40.0),
+        work_disk=DiskSnapshot(path=str(task.root), total_bytes=1000, used_bytes=300, free_bytes=700, percent=30.0, warning_level="ok"),
+        spill_disks=(DiskSnapshot(path=str(tmp_path / "spill"), total_bytes=2000, used_bytes=100, free_bytes=1900, percent=5.0, warning_level="ok"),),
+    )
+    monkeypatch.setattr(tui, "_system_snapshot_for_params", lambda params, task, sampler=None: snapshot)
+
+    guard = tui._RuntimeResourceGuard(task, params, CancellationToken())
+    guard.last_check = -10.0
+    guard.last_resource_log = -10.0
+    guard.tick({}, {})
+
+    records = [json.loads(line) for line in (task.logs_dir / "resource.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["cpu_percent"] == 12.5
+    assert records[-1]["memory_percent"] == 40.0
+    assert records[-1]["work_disk_free_bytes"] == 700
+    assert records[-1]["spill_disks"][0]["free_bytes"] == 1900
 
 
 def test_pipeline_step_output_dir_uses_workflow_output_metadata(tmp_path):
@@ -1466,6 +1677,38 @@ def test_workflow_download_progress_detail_matches_download_page_density():
     assert "512B/1.0KB" in detail
     assert "128B/s" in detail
     assert "剩余:" in detail
+
+
+def test_emit_workflow_step_progress_writes_download_log(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.models import RunContext, StepStatus
+    from rnaseq_workflow.core.task_params import TaskParams
+    from rnaseq_workflow.steps.download.models import DownloadProgress
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    context = RunContext(
+        "task-1",
+        tmp_path,
+        task.task_output_dir,
+        config={"task_workspace": task, "task_params": TaskParams(download_source="ena")},
+    )
+    seen = []
+    context.config["workflow_progress_callback"] = {"callback": lambda sample_id, step_id, status, message: seen.append((sample_id, step_id, status, message))}
+
+    tui._emit_workflow_step_progress(
+        context,
+        "SRR1",
+        "download",
+        DownloadProgress("SRR1", StepStatus.RUNNING, downloaded_bytes=512, expected_size_bytes=1024, speed_bps=128, message="downloading"),
+    )
+
+    assert seen[0][0:3] == ("SRR1", "download", StepStatus.RUNNING)
+    records = [json.loads(line) for line in (task.logs_dir / "downloads.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["accession"] == "SRR1"
+    assert records[-1]["source"] == "ena"
+    assert records[-1]["downloaded_bytes"] == 512
+    assert records[-1]["expected_bytes"] == 1024
 
 
 def test_load_manifest_expected_sizes_does_not_fetch_missing_by_default(monkeypatch):
@@ -2357,6 +2600,62 @@ def test_workflow_step_plan_adds_stringtie_when_selected():
     assert "stringtie" in tui._workflow_step_plan(TaskParams(expression_output_formats=["stringtie_fpkm"]))
 
 
+def test_required_docker_tools_include_stringtie_for_stringtie_outputs(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.task_params import TaskParams, write_task_params
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    write_task_params(TaskParams(expression_output_formats=["raw_counts", "stringtie_fpkm"]), task.metadata_dir / "params.json")
+
+    assert tui._required_docker_tools_for_params(task) == ["stringtie"]
+
+
+def test_set_task_reference_records_event(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.references import ReferenceAsset
+    from rich.console import Console
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    state = tui.TuiState(config=tmp_path / "config.yaml", console=Console(), asset_root=tmp_path / "workspace", user_id="user-1", task_id=task.task_id)
+    asset = ReferenceAsset(
+        reference_id="ref1",
+        root=tmp_path / "refs" / "ref1",
+        fasta=tmp_path / "refs" / "ref1" / "genome.fa",
+        annotation=None,
+        hisat2_index=tmp_path / "refs" / "ref1" / "hisat2" / "genome",
+        created_at="2026-01-01T00:00:00",
+        updated_at="2026-01-01T00:00:00",
+        provider="custom",
+        build_status="ready",
+        species="Arabidopsis thaliana",
+        taxon_id="3702",
+    )
+
+    tui._set_task_reference(task, state, asset)
+
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "reference_selected"
+    assert events[-1]["reference_id"] == "ref1"
+    assert events[-1]["species"] == "Arabidopsis thaliana"
+
+
+def test_record_task_event_swallows_logging_errors(monkeypatch, tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+
+    class BrokenLogManager:
+        def __init__(self, *args, **kwargs):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(tui, "TaskLogManager", BrokenLogManager)
+
+    tui._record_task_event(task, "task_selected", "task selected")
+
+
 def test_tool_run_wizard_input_page_previous(monkeypatch):
     from rnaseq_workflow.cli import tui
 
@@ -2424,6 +2723,9 @@ def test_migrate_sample_outputs_rewrites_progress_paths(tmp_path):
     assert sample.source_path == target_sam
     progress_text = task.progress_path.read_text(encoding="utf-8")
     assert json.dumps(str(target_sam))[1:-1] in progress_text
+    events = [json.loads(line) for line in (task.logs_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "artifact_moved"
+    assert events[-1]["current_path"] == str(target_root / "samples" / "S1" / "alignment")
 
 
 def test_trim_galore_cached_result_updates_sample_paths(tmp_path):
@@ -2463,6 +2765,26 @@ def test_workflow_finalize_readiness_waits_for_all_featurecounts(tmp_path):
     assert "S2:featurecounts=PENDING" in message
 
 
+def test_workflow_finalize_readiness_requires_featurecounts_files(tmp_path):
+    from rnaseq_workflow.cli import tui
+    from rnaseq_workflow.core.assets import AssetWorkspace
+    from rnaseq_workflow.core.models import Sample, StepResult, StepStatus
+    from rnaseq_workflow.persistence.json_state import JsonStateRepository
+    from rnaseq_workflow.steps.quantification.featurecounts import FeatureCountsStep
+
+    task = AssetWorkspace(tmp_path / "workspace").ensure_user("user-1").create_task()
+    repo = JsonStateRepository(task.progress_path)
+    samples = [Sample("S1", tmp_path / "S1.bam")]
+    step = FeatureCountsStep()
+    repo.mark_running(samples[0], step)
+    repo.save_step_result(step, StepResult("S1", "featurecounts", StepStatus.COMPLETED))
+
+    message = tui._workflow_finalize_readiness(task, samples)
+
+    assert "缺少定量产物" in message
+    assert "S1.featureCounts.txt" in message
+
+
 def test_finalize_completed_workflow_runs_after_all_featurecounts(monkeypatch, tmp_path):
     from rnaseq_workflow.cli import tui
     from rnaseq_workflow.core.assets import AssetWorkspace
@@ -2478,10 +2800,13 @@ def test_finalize_completed_workflow_runs_after_all_featurecounts(monkeypatch, t
     for sample in samples:
         repo.mark_running(sample, step)
         repo.save_step_result(step, StepResult(sample.sample_id, "featurecounts", StepStatus.COMPLETED))
+        table = task.task_output_dir / "samples" / sample.sample_id / "quantification" / f"{sample.sample_id}.featureCounts.txt"
+        table.parent.mkdir(parents=True, exist_ok=True)
+        table.write_text("ok", encoding="utf-8")
     called = {}
 
-    def fake_finalize(project_id, output_dir, final_samples, counts_matrix=None, report_json=None, report_markdown=None, state_path=None):
-        called["args"] = (project_id, output_dir, final_samples, counts_matrix, report_json, report_markdown, state_path)
+    def fake_finalize(project_id, output_dir, final_samples, reports_dir=None, counts_matrix=None, report_json=None, report_markdown=None, state_path=None):
+        called["args"] = (project_id, output_dir, final_samples, reports_dir, counts_matrix, report_json, report_markdown, state_path)
         return FinalizeResult([], counts_matrix, report_json, report_markdown, 2, 10)
 
     monkeypatch.setattr(tui, "finalize_project", fake_finalize)
@@ -2492,8 +2817,9 @@ def test_finalize_completed_workflow_runs_after_all_featurecounts(monkeypatch, t
     assert result is not None
     assert called["args"][0] == task.task_id
     assert called["args"][1] == tmp_path / "spill-task"
-    assert called["args"][3] == task.reports_dir / "count_matrix.tsv"
-    assert called["args"][6] == task.progress_path
+    assert called["args"][3] == task.reports_dir
+    assert called["args"][4] == task.reports_dir / "count_matrix.tsv"
+    assert called["args"][7] == task.progress_path
 
 
 def test_workflow_finalize_display_text_contains_output_paths(tmp_path):

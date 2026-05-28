@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from rnaseq_workflow.core.config import load_project_config
-from rnaseq_workflow.core.models import RunContext
+from rnaseq_workflow.core.models import RunContext, StepResult, StepStatus
 from rnaseq_workflow.core.pipeline import Pipeline
 from rnaseq_workflow.core.samples import samples_from_config
 from rnaseq_workflow.core.step_registry import build_pipeline_steps
@@ -98,6 +98,72 @@ def test_pipeline_emits_skipped_completed_event(tmp_path):
     )
 
     assert [event.event for event in events] == ["skipped_completed", "skipped_completed", "skipped_completed"]
+
+
+def test_pipeline_paused_step_stops_later_steps(tmp_path):
+    fastq = tmp_path / "S1.fastq"
+    fastq.write_text("@r1\nACGT\n+\nIIII\n", encoding="utf-8")
+    cfg = load_project_config(_write_config(tmp_path, fastq))
+    samples = samples_from_config(cfg.samples, cfg.project_id)
+    context = RunContext(project_id=cfg.project_id, work_dir=cfg.work_dir, output_dir=cfg.output_dir, dry_run=True)
+    repository = JsonStateRepository(cfg.output_dir / "progress.json")
+
+    class PausingStep:
+        step_id = "fastqc_trimmed"
+        name = "FastQC after trimming"
+
+        def validate_inputs(self, sample, context):
+            return None
+
+        def run(self, sample, context):
+            return StepResult(sample.sample_id, self.step_id, StepStatus.PAUSED, message="manual review")
+
+    class LaterStep:
+        step_id = "hisat2"
+        name = "HISAT2"
+
+        def validate_inputs(self, sample, context):
+            return None
+
+        def run(self, sample, context):
+            return StepResult(sample.sample_id, self.step_id, StepStatus.COMPLETED)
+
+    Pipeline(steps=[PausingStep(), LaterStep()], repository=repository).run_sample(samples[0], context)
+
+    state = json.loads((cfg.output_dir / "progress.json").read_text(encoding="utf-8"))
+    steps = state["samples"]["S1"]["steps"]
+    assert steps["fastqc_trimmed"]["status"] == "PAUSED"
+    assert "hisat2" not in steps
+
+
+def test_pipeline_reruns_completed_record_when_outputs_missing(tmp_path):
+    from rnaseq_workflow.core.models import Sample, StepResult, StepStatus
+    from rnaseq_workflow.persistence.json_state import JsonStateRepository
+
+    calls = []
+    sample = Sample("S1", tmp_path / "S1.fastq")
+    repo = JsonStateRepository(tmp_path / "progress.json")
+
+    class Step:
+        step_id = "featurecounts"
+        name = "featureCounts"
+
+        def validate_inputs(self, sample, context):
+            return None
+
+        def run(self, sample, context):
+            calls.append(sample.sample_id)
+            output = tmp_path / "S1.featureCounts.txt"
+            output.write_text("counts", encoding="utf-8")
+            return StepResult(sample.sample_id, self.step_id, StepStatus.COMPLETED, outputs=[output])
+
+    step = Step()
+    repo.mark_running(sample, step)
+    repo.save_step_result(step, StepResult("S1", "featurecounts", StepStatus.COMPLETED, outputs=[tmp_path / "missing.featureCounts.txt"]))
+
+    Pipeline([step], repo).run_sample(sample, RunContext("demo", tmp_path, tmp_path / "out", dry_run=False))
+
+    assert calls == ["S1"]
 
 
 def _write_config(tmp_path, fastq):

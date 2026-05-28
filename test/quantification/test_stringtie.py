@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from rnaseq_workflow.core.models import RunContext, Sample
-from rnaseq_workflow.steps.quantification.stringtie import StringTieStep, build_stringtie_command
+from rnaseq_workflow.steps.quantification.stringtie import StringTieStep, _stringtie_failure_message, build_stringtie_command
 
 
 def test_build_stringtie_command_with_gene_abundance():
@@ -44,3 +44,11 @@ def test_stringtie_step_dry_run(tmp_path):
     assert result.command[:4] == ["stringtie", str(tmp_path / "S1.bam"), "-p", "4"]
     assert result.outputs[0].name == "S1.stringtie.gtf"
     assert result.outputs[1].name == "S1.stringtie.gene_abund.tsv"
+
+
+def test_stringtie_missing_binary_message_is_actionable():
+    message = _stringtie_failure_message(
+        'docker: error during container init: exec: "stringtie": executable file not found in $PATH'
+    )
+
+    assert "Docker 镜像缺少 stringtie" in message

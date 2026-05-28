@@ -17,6 +17,7 @@ from rnaseq_workflow.core.config_validation import validate_project_config
 from rnaseq_workflow.core.doctor import run_doctor_checks
 from rnaseq_workflow.core.errors import ConfigError
 from rnaseq_workflow.core.finalize import finalize_project
+from rnaseq_workflow.core.logging import TaskLogManager
 from rnaseq_workflow.core.models import RunContext, Sample, SampleLayout, StepStatus
 from rnaseq_workflow.core.pipeline import Pipeline
 from rnaseq_workflow.core.references import (
@@ -622,13 +623,20 @@ def run(
         dry_run=dry_run,
     )
     repository = JsonStateRepository(cfg.output_dir / "progress.json")
-    pipeline = Pipeline(steps=steps, repository=repository)
+    log_manager = TaskLogManager(cfg.output_dir, task_id=cfg.project_id)
+    log_manager.event("workflow_started", message="workflow started", dry_run=dry_run, sample_count=len(samples))
+    pipeline = Pipeline(steps=steps, repository=repository, log_manager=log_manager)
     executor = LocalExecutor(pipeline=pipeline, max_workers=max_workers)
 
-    if progress:
-        run_executor_with_progress(console, executor, samples, context)
-    else:
-        executor.run(samples, context)
+    try:
+        if progress:
+            run_executor_with_progress(console, executor, samples, context)
+        else:
+            executor.run(samples, context)
+    except BaseException as exc:
+        log_manager.event("workflow_cancelled", level="CRITICAL", message=str(exc))
+        raise
+    log_manager.event("workflow_completed", message="workflow completed", dry_run=dry_run)
     state_path = cfg.output_dir / "progress.json"
     print_success(console, f"Workflow finished. State: {state_path}")
     print_run_summary(console, state_path)

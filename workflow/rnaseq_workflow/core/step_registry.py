@@ -5,7 +5,7 @@ from rnaseq_workflow.core.steps import PipelineStep
 from rnaseq_workflow.steps.alignment import Hisat2AlignStep, SamtoolsSortStep
 from rnaseq_workflow.steps.data_ingestion import SraToFastqStep
 from rnaseq_workflow.steps.placeholder import PlaceholderStep
-from rnaseq_workflow.steps.quality_control import FastQCStep
+from rnaseq_workflow.steps.quality_control import FastQCStep, TrimmedFastQCStep
 from rnaseq_workflow.steps.quantification import FeatureCountsStep, StringTieStep
 from rnaseq_workflow.steps.read_trimming import TrimGaloreStep
 
@@ -14,6 +14,7 @@ PIPELINE_STAGE_LABELS = {
     "download": "Download public data",
     "data_ingestion": "Prepare local inputs",
     "quality_control": "Quality control",
+    "trimmed_quality_control": "Trimmed read quality control",
     "read_trimming": "Read trimming",
     "alignment": "Alignment",
     "quantification": "Quantification",
@@ -23,6 +24,7 @@ PIPELINE_STAGE_LABELS = {
 DEFAULT_SAMPLE_STEPS = [
     "quality_control",
     "read_trimming",
+    "trimmed_quality_control",
     "alignment",
     "quantification",
 ]
@@ -62,6 +64,7 @@ def expand_step_ids(step_ids: list[str] | None) -> list[str]:
 _STEP_FACTORIES = {
     "sra_to_fastq": SraToFastqStep,
     "fastqc": FastQCStep,
+    "fastqc_trimmed": TrimmedFastQCStep,
     "trim_galore": TrimGaloreStep,
     "hisat2": Hisat2AlignStep,
     "samtools_sort": SamtoolsSortStep,
@@ -73,6 +76,7 @@ _STAGE_EXPANSIONS = {
     "data_ingestion": ["sra_to_fastq"],
     "quality_control": ["fastqc"],
     "read_trimming": ["trim_galore"],
+    "trimmed_quality_control": ["fastqc_trimmed"],
     "alignment": ["hisat2", "samtools_sort"],
     "quantification": ["featurecounts"],
 }

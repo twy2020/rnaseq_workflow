@@ -74,6 +74,8 @@ class TrimGaloreStep:
         paired = sample.layout == SampleLayout.PAIRED or len(fastq_paths) == 2
         if not bool(context.config.get("force", False)):
             if is_step_done(output_dir):
+                if not context.dry_run:
+                    _attach_trimmed_fastqs(sample, output_dir)
                 return skipped_done_result(sample, self.step_id, output_dir)
             if not context.dry_run and is_trim_galore_output_complete(output_dir, paired=paired):
                 outputs = [output_dir, *find_trimmed_fastq_outputs(output_dir)]
@@ -87,6 +89,7 @@ class TrimGaloreStep:
                     outputs=outputs,
                 )
                 write_done_marker(output_dir, recovered)
+                _attach_trimmed_fastqs(sample, output_dir)
                 release_lock(output_dir / ".lock")
                 return recovered
         options = TrimGaloreOptions(
@@ -128,6 +131,7 @@ class TrimGaloreStep:
             )
             if step_result.status == StepStatus.COMPLETED and not context.dry_run:
                 write_done_marker(output_dir, step_result)
+                _attach_trimmed_fastqs(sample, output_dir)
             elif bool(context.config.get("cleanup_on_fail", True)):
                 write_error_log(output_dir, step_result.message)
                 cleanup_incomplete_output_keep_errors(output_dir)
@@ -141,10 +145,7 @@ class TrimGaloreStep:
         trimmed = find_trimmed_fastq_outputs(output_dir)
         if not trimmed:
             return
-        sample.source_path = trimmed[0]
-        sample.source_paths = trimmed
-        sample.layout = SampleLayout.PAIRED if len(trimmed) >= 2 else SampleLayout.SINGLE
-        sample.metadata["input_type"] = "fastq"
+        _attach_trimmed_fastqs(sample, output_dir)
 
 
 def find_trimmed_fastq_outputs(output_dir: str | Path) -> list[Path]:
@@ -163,6 +164,17 @@ def is_trim_galore_output_complete(output_dir: str | Path, paired: bool) -> bool
 
 def _fastq_paths(sample: Sample) -> list[Path]:
     return [path for path in sample.source_paths if _is_fastq(path)]
+
+
+def _attach_trimmed_fastqs(sample: Sample, output_dir: str | Path) -> None:
+    trimmed = find_trimmed_fastq_outputs(output_dir)
+    if not trimmed:
+        return
+    sample.source_path = trimmed[0]
+    sample.source_paths = trimmed
+    sample.layout = SampleLayout.PAIRED if len(trimmed) >= 2 else SampleLayout.SINGLE
+    sample.metadata["input_type"] = "fastq"
+    sample.metadata["trimmed_fastq_dir"] = str(Path(output_dir))
 
 
 def _is_fastq(path: Path) -> bool:

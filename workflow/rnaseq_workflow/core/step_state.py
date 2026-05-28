@@ -43,8 +43,40 @@ def write_done_marker(output_dir: Path, result: StepResult) -> None:
         "return_code": result.return_code,
         "message": result.message,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "log_file": result.log_file,
+        "command_id": result.extra.get("command_id"),
+        "command_ids": result.extra.get("command_ids"),
+        "command_log_file": result.extra.get("command_log_file"),
     }
     done_marker(output_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_done_marker_links(output_dir: Path, result: StepResult) -> None:
+    marker = done_marker(output_dir)
+    if not marker.exists():
+        return
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(
+        {
+            "log_file": result.log_file,
+            "command_id": result.extra.get("command_id"),
+            "command_ids": result.extra.get("command_ids"),
+            "command_log_file": result.extra.get("command_log_file"),
+        }
+    )
+    marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_done_markers_for_result(result: StepResult) -> None:
+    for output in result.outputs:
+        path = Path(output)
+        if path.is_dir():
+            update_done_marker_links(path, result)
 
 
 def acquire_lock(output_dir: Path) -> Path:

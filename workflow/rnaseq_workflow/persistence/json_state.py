@@ -31,6 +31,18 @@ class JsonStateRepository:
         raw["status"] = StepStatus(raw["status"])
         return StepRecord(**raw)
 
+    def get_sample_pause_record(self, sample_id: str) -> StepRecord | None:
+        with self._lock:
+            data = self._read()
+        steps = data.get("samples", {}).get(sample_id, {}).get("steps", {})
+        for raw in steps.values():
+            if not isinstance(raw, dict) or raw.get("status") != StepStatus.PAUSED.value:
+                continue
+            record = dict(raw)
+            record["status"] = StepStatus(record["status"])
+            return StepRecord(**record)
+        return None
+
     def mark_running(self, sample: Sample, step: PipelineStep) -> None:
         with self._lock:
             data = self._read()
@@ -51,6 +63,7 @@ class JsonStateRepository:
                 "started_at": _now(),
                 "finished_at": None,
                 "extra": {},
+                "log_file": None,
             }
             self._write(data)
 
@@ -72,6 +85,7 @@ class JsonStateRepository:
                 "started_at": previous.get("started_at") or _now(),
                 "finished_at": _now(),
                 "extra": result.extra,
+                "log_file": result.log_file,
             }
             sample_data["steps"][result.step_id] = record
             self._write(data)

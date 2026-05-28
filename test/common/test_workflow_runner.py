@@ -24,6 +24,12 @@ class RerunCompletedStep(RecordingStep):
     rerun_completed = True
 
 
+class PausingStep(RecordingStep):
+    def run(self, sample, context):
+        self.calls.append((sample.sample_id, self.step_id))
+        return StepResult(sample.sample_id, self.step_id, StepStatus.PAUSED, message="manual review")
+
+
 def test_sample_pipeline_runs_each_sample_through_steps_before_next_sample(tmp_path):
     calls: list[tuple[str, str]] = []
     steps = [RecordingStep("a", calls), RecordingStep("b", calls)]
@@ -49,6 +55,24 @@ def test_stage_batch_runs_all_samples_per_step(tmp_path):
     )
 
     assert calls == [("S1", "a"), ("S2", "a"), ("S1", "b"), ("S2", "b")]
+
+
+def test_stage_batch_skips_later_stage_for_paused_sample(tmp_path):
+    calls: list[tuple[str, str]] = []
+    steps = [PausingStep("fastqc_trimmed", calls), RecordingStep("hisat2", calls)]
+    samples = [Sample("S1", tmp_path / "S1.fastq")]
+    repo = JsonStateRepository(tmp_path / "state-paused.json")
+
+    WorkflowRunner(steps, repo, mode="stage_batch", max_workers=1).run(
+        samples,
+        RunContext("demo", tmp_path, tmp_path / "out", dry_run=True),
+    )
+
+    assert calls == [("S1", "fastqc_trimmed")]
+    record = repo.get_step_record("S1", "hisat2")
+    assert record is not None
+    assert record.status == StepStatus.SKIPPED
+    assert record.extra["skip_reason"] == "sample_paused"
 
 
 def test_rerun_completed_step_does_not_skip_existing_completed_record(tmp_path):

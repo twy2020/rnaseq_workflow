@@ -8,6 +8,7 @@ import shutil
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -55,6 +56,7 @@ from rnaseq_workflow.core.config_validation import validate_project_config
 from rnaseq_workflow.core.cancellation import CancellationToken
 from rnaseq_workflow.core.doctor import run_doctor_checks
 from rnaseq_workflow.core.finalize import FinalizeResult, finalize_project
+from rnaseq_workflow.core.logging import TaskLogManager
 from rnaseq_workflow.core.models import RunContext, Sample, SampleLayout, StepResult, StepStatus
 from rnaseq_workflow.core.pipeline import Pipeline
 from rnaseq_workflow.core.reference_sources import PreparedReference
@@ -453,6 +455,7 @@ def _task_management_menu(state: TuiState) -> None:
                 ("delete", "删除当前任务"),
                 ("show", "查看当前任务"),
                 ("sample_metadata", "样本元数据更新/手动修改"),
+                ("logs", "日志中心"),
                 ("stats", "产物统计"),
                 ("cleanup_outputs", "产物清理"),
                 ("workflow", "进入 Workflow 向导"),
@@ -477,6 +480,8 @@ def _task_management_menu(state: TuiState) -> None:
             _show_current_task(state)
         elif choice == "sample_metadata":
             _task_sample_metadata_page(state)
+        elif choice == "logs":
+            _task_log_center_page(state)
         elif choice == "stats":
             _task_artifact_stats_page(state)
         elif choice == "cleanup_outputs":
@@ -561,6 +566,19 @@ def _set_logged_in_user(state: TuiState, user: DbUser) -> None:
     state.task_id = None
 
 
+def _task_log_manager(task: TaskWorkspace) -> TaskLogManager:
+    return TaskLogManager(task.root, task_id=task.task_id, user_id=task.user_id)
+
+
+def _record_task_event(task: TaskWorkspace, event: str, message: str = "", level: str = "INFO", **fields: Any) -> None:
+    try:
+        manager = _task_log_manager(task)
+        manager.event(event, level=level, message=message, **fields)
+        manager.tui(message or event, event=event, level=level, **fields)
+    except Exception:
+        pass
+
+
 def _ensure_user(state: TuiState, force: bool = False) -> str | None:
     if state.user_id and not force:
         return state.user_id
@@ -593,8 +611,14 @@ def _create_task(state: TuiState) -> TaskWorkspace | None:
     user_id = _ensure_user(state)
     if not user_id:
         return None
-    task_name = _input("任务名称", "可留空，目录仍使用 UUID。", "") or ""
-    description = _input("任务描述", "可留空。", "") or ""
+    task_name_value = _input("任务名称", "可留空，目录仍使用 UUID。", "")
+    if task_name_value is None:
+        return None
+    description_value = _input("任务描述", "可留空。", "")
+    if description_value is None:
+        return None
+    task_name = task_name_value or ""
+    description = description_value or ""
     task = state.workspace.ensure_user(user_id).create_task(task_name=task_name, description=description)
     state.workspace.database.upsert_task(
         task_id=task.task_id,
@@ -605,6 +629,7 @@ def _create_task(state: TuiState) -> TaskWorkspace | None:
         status="created",
     )
     state.task_id = task.task_id
+    _record_task_event(task, "task_created", "task created", task_name=task_name, description=description)
     _message("任务已创建", f"任务: {_task_display_name(task)}\n目录: {task.root}")
     return task
 
@@ -632,6 +657,14 @@ def _select_task(state: TuiState) -> TaskWorkspace | None:
         task_dir=task.root,
         task_name=metadata.task_name if metadata else "",
         description=metadata.description if metadata else "",
+        status=metadata.status if metadata else "created",
+        reference_id=metadata.reference_id if metadata else None,
+    )
+    _record_task_event(
+        task,
+        "task_selected",
+        "task selected",
+        task_name=metadata.task_name if metadata else "",
         status=metadata.status if metadata else "created",
         reference_id=metadata.reference_id if metadata else None,
     )
@@ -838,6 +871,217 @@ def _task_artifact_cleanup_page(state: TuiState) -> None:
         _message("清理完成", f"已清理 {_format_bytes(removed)}。")
 
 
+def _task_log_center_page(state: TuiState) -> None:
+    task = state.task
+    if not task:
+        _message("未选择任务", "请先选择任务。")
+        return
+    while True:
+        choice = _menu(
+            "日志中心",
+            _task_log_center_text(task),
+            [
+                ("events", "查看任务事件"),
+                ("commands", "查看命令审计"),
+                ("downloads", "查看下载日志"),
+                ("failures", "查看失败步骤日志"),
+                ("export", "导出日志包"),
+                ("clean_success", "压缩成功步骤日志"),
+                ("back", "返回"),
+            ],
+        )
+        if choice in (None, "back"):
+            return
+        if choice == "events":
+            _capture_output(state, lambda console: _print_jsonl_records(console, "任务事件", task.logs_dir / "events.jsonl"), "任务事件")
+        elif choice == "commands":
+            _capture_output(state, lambda console: _print_jsonl_records(console, "命令审计", task.logs_dir / "commands.jsonl"), "命令审计")
+        elif choice == "downloads":
+            _capture_output(state, lambda console: _print_jsonl_records(console, "下载日志", task.logs_dir / "downloads.jsonl"), "下载日志")
+        elif choice == "failures":
+            _capture_output(state, lambda console: _print_failed_step_logs(console, task), "失败步骤日志")
+        elif choice == "export":
+            try:
+                archive = _export_task_log_package(task)
+            except OSError as exc:
+                _message("导出失败", str(exc))
+                continue
+            _record_task_event(task, "logs_exported", "logs exported", archive_path=str(archive), size_bytes=_safe_file_size(archive))
+            _message("日志包已导出", str(archive))
+        elif choice == "clean_success":
+            archive, removed = _archive_success_step_logs(task)
+            if removed:
+                _record_task_event(task, "logs_cleaned", "successful step logs archived", archive_path=str(archive), removed_logs=removed, size_bytes=_safe_file_size(archive))
+                _message("成功步骤日志已压缩", f"{archive}\nremoved_logs={removed}")
+            else:
+                _message("无需清理", "没有可压缩的成功步骤日志。")
+
+
+def _task_log_center_text(task: TaskWorkspace) -> str:
+    counts = {
+        "events": _line_count(task.logs_dir / "events.jsonl"),
+        "commands": _line_count(task.logs_dir / "commands.jsonl"),
+        "downloads": _line_count(task.logs_dir / "downloads.jsonl"),
+        "resource": _line_count(task.logs_dir / "resource.jsonl"),
+        "failures": len(_failed_step_log_paths(task)),
+    }
+    return "\n".join(
+        [
+            f"日志目录: {task.logs_dir}",
+            f"events={counts['events']} commands={counts['commands']} downloads={counts['downloads']} resource={counts['resource']} failures={counts['failures']}",
+        ]
+    )
+
+
+def _read_jsonl_tail(path: Path, limit: int = 40) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            record = {"raw": line}
+        if isinstance(record, dict):
+            rows.append(record)
+    return rows[-limit:]
+
+
+def _print_jsonl_records(console: Console, title: str, path: Path, limit: int = 40) -> None:
+    rows = _read_jsonl_tail(path, limit=limit)
+    if not rows:
+        console.print(f"[yellow]{path} 暂无记录[/yellow]")
+        return
+    preferred = ["time", "event", "level", "sample_id", "step_id", "status", "return_code", "command_id", "message"]
+    columns = [key for key in preferred if any(key in row for row in rows)]
+    for row in rows:
+        for key in row:
+            if key not in columns and len(columns) < 8:
+                columns.append(key)
+    table = Table(title=f"{title}: {path.name} 最近 {len(rows)} 条", expand=True)
+    for column in columns:
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*[_compact_log_value(row.get(column)) for column in columns])
+    console.print(table)
+
+
+def _compact_log_value(value: Any, limit: int = 120) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    text = text.replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _failed_step_log_paths(task: TaskWorkspace) -> list[Path]:
+    records = _progress_step_records(task)
+    paths = []
+    for record in records:
+        if record.get("status") != StepStatus.FAILED.value:
+            continue
+        raw = str(record.get("log_file") or record.get("extra", {}).get("log_file") or "").strip()
+        if not raw:
+            continue
+        path = task.root / raw if not Path(raw).is_absolute() else Path(raw)
+        if path.exists():
+            paths.append(path)
+    return paths
+
+
+def _progress_step_records(task: TaskWorkspace) -> list[dict[str, Any]]:
+    if not task.progress_path.exists():
+        return []
+    try:
+        data = json.loads(task.progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    records: list[dict[str, Any]] = []
+    for sample_data in (data.get("samples") or {}).values():
+        if not isinstance(sample_data, dict):
+            continue
+        for record in (sample_data.get("steps") or {}).values():
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
+def _print_failed_step_logs(console: Console, task: TaskWorkspace) -> None:
+    paths = _failed_step_log_paths(task)
+    if not paths:
+        console.print("[green]没有失败步骤日志。[/green]")
+        return
+    for path in paths[-10:]:
+        console.print(f"[red]{path}[/red]")
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            console.print(f"读取失败: {exc}")
+            continue
+        console.print(_tail(text, 4000))
+
+
+def _export_task_log_package(task: TaskWorkspace) -> Path:
+    task.logs_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir = task.logs_dir / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    archive = archive_dir / f"{task.task_id}_logs_{timestamp}.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+        for path in sorted(task.logs_dir.rglob("*")):
+            if not path.is_file() or archive_dir in path.parents:
+                continue
+            handle.write(path, path.relative_to(task.logs_dir))
+        for path in (task.progress_path, task.metadata_path, task.metadata_dir / "manifest.json", task.metadata_dir / "params.json", task.metadata_dir / "resource_check.json", task.metadata_dir / "artifact_locations.json"):
+            if path.exists() and path.is_file():
+                handle.write(path, Path("metadata") / path.name)
+    return archive
+
+
+def _archive_success_step_logs(task: TaskWorkspace) -> tuple[Path, int]:
+    paths = _success_step_log_paths(task)
+    archive_dir = task.logs_dir / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive = archive_dir / f"{task.task_id}_success_step_logs_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+    if not paths:
+        return archive, 0
+    removed = 0
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+        for path in paths:
+            if not path.exists() or not path.is_file():
+                continue
+            handle.write(path, path.relative_to(task.logs_dir))
+            path.unlink()
+            removed += 1
+    return archive, removed
+
+
+def _success_step_log_paths(task: TaskWorkspace) -> list[Path]:
+    paths: list[Path] = []
+    failed = set(_failed_step_log_paths(task))
+    for record in _progress_step_records(task):
+        if record.get("status") not in {StepStatus.COMPLETED.value, StepStatus.SKIPPED.value}:
+            continue
+        raw = str(record.get("log_file") or record.get("extra", {}).get("log_file") or "").strip()
+        if not raw:
+            continue
+        path = task.root / raw if not Path(raw).is_absolute() else Path(raw)
+        if path.exists() and path not in failed:
+            paths.append(path)
+    return paths
+
+
+def _line_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
+
+
 def _task_artifact_targets(task: TaskWorkspace) -> list[_ArtifactTarget]:
     local_targets = [
         ("downloads", "下载文件", task.downloads_dir, "下载得到的 FASTQ/SRA 和半成品。"),
@@ -939,6 +1183,7 @@ def _remove_task_artifacts(task: TaskWorkspace, targets: list[_ArtifactTarget]) 
     removed = 0
     root = task.root.resolve()
     allowed_external_paths = _registered_external_artifact_paths(task)
+    cleaned: list[dict[str, Any]] = []
     for target in targets:
         path = target.path.resolve()
         inside_task = path != root and root in path.parents
@@ -946,6 +1191,16 @@ def _remove_task_artifacts(task: TaskWorkspace, targets: list[_ArtifactTarget]) 
         if not inside_task and not registered_external:
             raise ValueError(f"refuse to clean outside task dir: {path}")
         removed += target.size_bytes
+        cleaned.append(
+            {
+                "key": target.key,
+                "label": target.label,
+                "path": str(path),
+                "files": target.files,
+                "size_bytes": target.size_bytes,
+                "external": target.external,
+            }
+        )
         if path.exists():
             if path.is_dir():
                 shutil.rmtree(path)
@@ -953,6 +1208,14 @@ def _remove_task_artifacts(task: TaskWorkspace, targets: list[_ArtifactTarget]) 
             else:
                 path.unlink()
     task.ensure()
+    if cleaned and not any(row["key"] == "logs" for row in cleaned):
+        _record_task_event(
+            task,
+            "artifact_cleaned",
+            "task artifacts cleaned",
+            removed_bytes=removed,
+            targets=cleaned,
+        )
     return removed
 
 
@@ -1279,6 +1542,16 @@ def _workflow_manifest_page(state: TuiState) -> None:
     if parsed.accessions:
         _enrich_manifest_sra_metadata(manifest_data)
     _write_task_manifest_record(task, manifest_data)
+    _record_task_event(
+        task,
+        "manifest_submitted",
+        "manifest submitted",
+        mode=mode,
+        accessions=len(parsed.accessions),
+        urls=len(parsed.urls),
+        errors=len(parsed.errors),
+        manifest_path=str(task.metadata_dir / "manifest.json"),
+    )
     if not parsed.ok:
         _message("清单校验失败", "\n".join(parsed.errors))
         return
@@ -1370,6 +1643,15 @@ def _workflow_local_manifest_page(state: TuiState, task: TaskWorkspace) -> None:
     manifest_path = task.metadata_dir / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _record_task_event(
+        task,
+        "manifest_submitted",
+        "local manifest submitted",
+        mode="local",
+        local_files=len(files),
+        errors=len(errors),
+        manifest_path=str(manifest_path),
+    )
     _capture_output(
         state,
         lambda console: _print_local_manifest_scan(console, files, errors),
@@ -1503,6 +1785,20 @@ def _workflow_params_page(state: TuiState) -> None:
         _message("参数校验失败", "\n".join(f"{issue.field}: {issue.message}" for issue in issues))
         return
     path = write_task_params(params, task.metadata_dir / "params.json")
+    _record_task_event(
+        task,
+        "params_saved",
+        "workflow params saved",
+        params_path=str(path),
+        execution_mode=params.execution_mode,
+        max_workers=params.max_workers,
+        download_workers=params.download_workers,
+        download_source=params.download_source,
+        expression_output_formats=params.expression_output_formats,
+        resource_guard_enabled=params.resource_guard_enabled,
+        disk_guard_strategy=params.disk_guard_strategy,
+        spill_large_outputs=params.spill_large_outputs,
+    )
     _message("参数已保存", str(path))
 
 
@@ -1555,6 +1851,7 @@ def _task_params_wizard(defaults: TaskParams, feature_type: str, attribute_type:
         ("spill_paths", "产物转移路径", "仅在转移策略下使用。可填写多个路径，用分号分隔；优先使用第一个空间足够的路径。", "str", None, ()),
         ("sra_threads", "SRA 转 FASTQ 线程数", _friendly_field("fasterq-dump 线程数")[1], "int", 1, ()),
         ("fastqc_threads", "FastQC 线程数", _friendly_field("FastQC 线程数")[1], "int", 1, ()),
+        ("trimmed_fastqc_policy", "二次质控策略", "默认进行 Trim 后 FastQC 并保留结果；可改为质量异常暂停样本，或完全跳过二次质控。", "choice", None, (("run_keep", "运行并保留结果"), ("pause_on_fail", "异常时暂停样本"), ("disabled", "不进行二次质控"))),
         ("trim_quality", "修剪质量阈值", _friendly_field("Trim quality")[1], "int", 0, ()),
         ("trim_cores", "Trim Galore 核心数", _friendly_field("Trim Galore cores")[1], "int", 1, ()),
         ("hisat2_threads", "HISAT2 线程数", _friendly_field("HISAT2 线程数")[1], "int", 1, ()),
@@ -1584,6 +1881,7 @@ def _task_params_wizard(defaults: TaskParams, feature_type: str, attribute_type:
         "spill_paths": "; ".join(defaults.spill_paths),
         "sra_threads": defaults.sra_threads,
         "fastqc_threads": defaults.fastqc_threads,
+        "trimmed_fastqc_policy": defaults.trimmed_fastqc_policy,
         "trim_quality": defaults.trim_quality,
         "trim_cores": defaults.trim_cores,
         "hisat2_threads": defaults.hisat2_threads,
@@ -1922,9 +2220,25 @@ def _workflow_resource_check_page(state: TuiState) -> None:
         docker_image = data.get("docker_image") or docker_image
     estimate_input_dir, sample_count = _resource_estimate_inputs(task)
     estimate = estimate_workflow_resources(estimate_input_dir, sample_count=sample_count)
-    checks = run_resource_checks(task.root, docker_image=docker_image, estimate=estimate)
+    checks = run_resource_checks(
+        task.root,
+        docker_image=docker_image,
+        estimate=estimate,
+        required_docker_tools=_required_docker_tools_for_params(task),
+    )
     write_resource_checks(checks, task.metadata_dir / "resource_check.json", estimate=estimate)
     _write_resource_settings(task, estimate)
+    _record_task_event(
+        task,
+        "resource_check_completed",
+        "resource check completed",
+        ok=all(check.ok for check in checks),
+        checks=len(checks),
+        error_count=sum(1 for check in checks if not check.ok and check.level == "error"),
+        warning_count=sum(1 for check in checks if not check.ok and check.level != "error"),
+        estimate=estimate.to_dict(),
+        docker_image=docker_image,
+    )
     _capture_output(state, lambda console: _print_resource_checks(console, checks, estimate), "资源检查")
 
 
@@ -1959,6 +2273,20 @@ def _write_resource_settings(task: TaskWorkspace, estimate) -> None:
             data = {}
     data["resource_estimate"] = estimate.to_dict()
     params_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _required_docker_tools_for_params(task: TaskWorkspace) -> list[str]:
+    params_path = task.metadata_dir / "params.json"
+    if not params_path.exists():
+        return []
+    try:
+        params = read_task_params(params_path)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return []
+    tools: list[str] = []
+    if _stringtie_outputs_enabled(params.expression_output_formats):
+        tools.append("stringtie")
+    return tools
 
 
 def _print_resource_checks(console: Console, checks, estimate=None) -> None:
@@ -2075,11 +2403,14 @@ def _workflow_run_page(state: TuiState) -> None:
     context.config["task_workspace"] = task
     context.config["task_params"] = params
     context.config["_output_root_lock"] = threading.Lock()
+    log_manager = TaskLogManager(task.root, task_id=task.task_id, user_id=task.user_id)
+    log_manager.event("workflow_started", message="workflow started", sample_count=len(samples), mode=params.execution_mode)
     summary, events, finalize_result, finalize_message = _run_workflow_with_tui_progress(
         samples=samples,
         context=context,
         steps=steps,
         repository=JsonStateRepository(task.progress_path),
+        log_manager=log_manager,
         mode=params.execution_mode,
         max_workers=runner_workers,
         processing_workers=params.max_workers,
@@ -2112,7 +2443,10 @@ def _workflow_processing_output_dir(task: TaskWorkspace, params: TaskParams) -> 
 
 
 def _workflow_step_plan(params: TaskParams) -> list[str]:
-    steps = ["data_ingestion", "quality_control", "read_trimming", "alignment", "featurecounts"]
+    steps = ["data_ingestion", "quality_control", "read_trimming"]
+    if params.trimmed_fastqc_policy != "disabled":
+        steps.append("trimmed_quality_control")
+    steps.extend(["alignment", "featurecounts"])
     if _stringtie_outputs_enabled(params.expression_output_formats):
         steps.append("stringtie")
     return steps
@@ -2249,6 +2583,17 @@ def _set_task_reference(task: TaskWorkspace, state: TuiState, asset: ReferenceAs
         description=description,
         status=status,
         reference_id=reference_id,
+    )
+    _record_task_event(
+        task,
+        "reference_selected" if asset else "reference_cleared",
+        "reference selected" if asset else "reference cleared",
+        reference_id=reference_id,
+        reference_root=str(asset.root) if asset else None,
+        provider=asset.provider if asset else None,
+        build_status=asset.build_status if asset else None,
+        species=asset.species if asset else None,
+        taxon_id=asset.taxon_id if asset else None,
     )
     state.workspace.database.upsert_task(
         task_id=task.task_id,
@@ -2898,6 +3243,7 @@ def _acquire_semaphore_cancelable(semaphore: threading.BoundedSemaphore, token) 
 
 
 def _emit_workflow_step_progress(context: RunContext, sample_id: str, step_id: str, progress) -> None:
+    _record_download_progress(context, sample_id, step_id, progress)
     _emit_workflow_text_progress(context, sample_id, step_id, progress.status, _workflow_download_progress_detail(progress))
 
 
@@ -2927,6 +3273,35 @@ def _workflow_download_progress_detail(progress) -> str:
     if progress.message:
         parts.append(_compact_progress_detail(progress.message))
     return " ".join(parts)
+
+
+def _record_download_progress(context: RunContext, sample_id: str, step_id: str, progress) -> None:
+    task = context.config.get("task_workspace")
+    if not isinstance(task, TaskWorkspace):
+        return
+    try:
+        _task_log_manager(task).download(
+            accession=getattr(progress, "accession", sample_id),
+            sample_id=sample_id,
+            step_id=step_id,
+            source=_download_source_for_context(context),
+            status=getattr(progress, "status", StepStatus.RUNNING).value,
+            downloaded_bytes=int(getattr(progress, "downloaded_bytes", 0) or 0),
+            expected_bytes=getattr(progress, "expected_size_bytes", None),
+            speed_bytes_per_sec=float(getattr(progress, "speed_bps", 0.0) or 0.0),
+            percent=getattr(progress, "percent", None),
+            local_path=str(getattr(progress, "local_path", "") or ""),
+            message=str(getattr(progress, "message", "") or ""),
+        )
+    except Exception:
+        pass
+
+
+def _download_source_for_context(context: RunContext) -> str:
+    params = context.config.get("task_params")
+    if isinstance(params, TaskParams):
+        return params.download_source
+    return str(context.config.get("download_source") or "unknown")
 
 
 def _materialize_local_input_links(task: TaskWorkspace, local_files: list[dict[str, Any]]) -> Path:
@@ -3036,6 +3411,7 @@ def _params_to_run_config(params: TaskParams) -> dict:
         "fasterq_dump_threads": params.sra_threads,
         "fastqc_threads": params.fastqc_threads,
         "fastqc_quiet": True,
+        "trimmed_fastqc_policy": params.trimmed_fastqc_policy,
         "trim_galore_quality": params.trim_quality,
         "trim_galore_cores": params.trim_cores,
         "trim_galore_gzip": True,
@@ -3071,6 +3447,7 @@ def _finalize_completed_workflow(
         return None, readiness
     try:
         finalize_kwargs = {
+            "reports_dir": task.reports_dir,
             "counts_matrix": task.reports_dir / "count_matrix.tsv",
             "report_json": task.reports_dir / "report.json",
             "report_markdown": task.reports_dir / "report.md",
@@ -3113,7 +3490,67 @@ def _workflow_finalize_readiness(task: TaskWorkspace, samples: list[Sample]) -> 
         preview = ", ".join(f"{key}={status}" for key, status in sorted(incomplete.items())[:8])
         suffix = f" 等 {len(incomplete)} 个步骤" if len(incomplete) > 8 else ""
         return f"未执行汇总：需等待全部样本定量步骤完成；未就绪 {preview}{suffix}。"
+    missing_outputs = _workflow_finalize_missing_outputs(task, samples, required_steps, data)
+    if missing_outputs:
+        preview = ", ".join(str(path) for path in missing_outputs[:6])
+        suffix = f" 等 {len(missing_outputs)} 个文件" if len(missing_outputs) > 6 else ""
+        return f"未执行汇总：缺少定量产物 {preview}{suffix}。"
     return ""
+
+
+def _workflow_finalize_missing_outputs(task: TaskWorkspace, samples: list[Sample], required_steps: list[str], progress_data: dict[str, Any] | None = None) -> list[Path]:
+    output_roots = _workflow_output_roots(task, samples)
+    missing: list[Path] = []
+    if "featurecounts" in required_steps:
+        missing.extend(_missing_sample_outputs(output_roots, samples, "featurecounts", "quantification", "{sample_id}.featureCounts.txt", progress_data))
+    if "stringtie" in required_steps:
+        missing.extend(_missing_sample_outputs(output_roots, samples, "stringtie", "quantification", "{sample_id}.stringtie.gene_abund.tsv", progress_data))
+    return missing
+
+
+def _workflow_output_roots(task: TaskWorkspace, samples: list[Sample]) -> list[Path]:
+    roots: list[Path] = []
+    for raw in [task.task_output_dir, *(sample.metadata.get("_workflow_output_dir") for sample in samples)]:
+        if raw is None:
+            continue
+        path = Path(raw)
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
+def _missing_sample_outputs(
+    output_roots: list[Path],
+    samples: list[Sample],
+    step_id: str,
+    subdir: str,
+    filename_template: str,
+    progress_data: dict[str, Any] | None = None,
+) -> list[Path]:
+    missing: list[Path] = []
+    for sample in samples:
+        candidates = _step_output_candidates(progress_data, sample.sample_id, step_id, filename_template.format(sample_id=sample.sample_id))
+        candidates.extend(
+            root / "samples" / sample.sample_id / subdir / filename_template.format(sample_id=sample.sample_id)
+            for root in output_roots
+        )
+        if not any(path.exists() and path.stat().st_size > 0 for path in candidates):
+            missing.append(candidates[0] if candidates else Path(filename_template.format(sample_id=sample.sample_id)))
+    return missing
+
+
+def _step_output_candidates(progress_data: dict[str, Any] | None, sample_id: str, step_id: str, filename: str) -> list[Path]:
+    if not progress_data:
+        return []
+    record = progress_data.get("samples", {}).get(sample_id, {}).get("steps", {}).get(step_id)
+    if not isinstance(record, dict):
+        return []
+    candidates = []
+    for raw in record.get("outputs") or []:
+        path = Path(str(raw))
+        if path.name == filename:
+            candidates.append(path)
+    return candidates
 
 
 def _workflow_status_counts(task: TaskWorkspace, samples: list[Sample], steps: list[Any]) -> dict[str, int]:
@@ -3124,6 +3561,7 @@ def _workflow_status_counts(task: TaskWorkspace, samples: list[Sample], steps: l
         StepStatus.SKIPPED.value: 0,
         StepStatus.FAILED.value: 0,
         StepStatus.CANCELLED.value: 0,
+        StepStatus.PAUSED.value: 0,
         StepStatus.RUNNING.value: 0,
         StepStatus.PENDING.value: 0,
     }
@@ -3180,6 +3618,7 @@ def _print_workflow_run_summary(
         skipped = status_counts.get(StepStatus.SKIPPED.value, 0)
         failed = status_counts.get(StepStatus.FAILED.value, 0)
         cancelled = status_counts.get(StepStatus.CANCELLED.value, 0)
+        paused = status_counts.get(StepStatus.PAUSED.value, 0)
         running = status_counts.get(StepStatus.RUNNING.value, 0)
         pending = status_counts.get(StepStatus.PENDING.value, 0)
         done = completed + skipped
@@ -3189,6 +3628,7 @@ def _print_workflow_run_summary(
         table.add_row("skipped", str(skipped))
         table.add_row("failed", str(failed))
         table.add_row("cancelled", str(cancelled))
+        table.add_row("paused", str(paused))
         table.add_row("running", str(running))
         table.add_row("pending", str(pending))
     else:
@@ -3269,6 +3709,7 @@ def _run_workflow_with_tui_progress(
     mode: str,
     max_workers: int,
     title: str,
+    log_manager: TaskLogManager | None = None,
     processing_workers: int | None = None,
     download_workers: int | None = None,
     finalize_callback: Callable[[], tuple[FinalizeResult | None, str]] | None = None,
@@ -3361,6 +3802,7 @@ def _run_workflow_with_tui_progress(
                 mode=mode,
                 max_workers=max_workers,
                 event_callback=on_event,
+                log_manager=log_manager,
             )
             result_holder["summary"] = runner.run(samples, context)
             result_holder["events"] = list(runner.events)
@@ -3370,7 +3812,14 @@ def _run_workflow_with_tui_progress(
                 result_holder["finalize_message"] = finalize_message
         except BaseException as exc:
             result_holder["error"] = exc
+            if log_manager is not None:
+                log_manager.event("workflow_cancelled", level="CRITICAL", message=str(exc))
         finally:
+            if log_manager is not None and result_holder["error"] is None:
+                if cancel_token.is_cancelled():
+                    log_manager.event("workflow_cancelled", level="WARNING", message="workflow cancelled")
+                else:
+                    log_manager.event("workflow_completed", message="workflow completed")
             result_holder["done"] = True
 
     def expected_size_worker() -> None:
@@ -3541,12 +3990,13 @@ def _stage_batch_progress_text(
     completed = sum(1 for value in statuses.values() if value == StepStatus.COMPLETED.value)
     failed = sum(1 for value in statuses.values() if value == StepStatus.FAILED.value)
     cancelled = sum(1 for value in statuses.values() if value == StepStatus.CANCELLED.value)
+    paused = sum(1 for value in statuses.values() if value == StepStatus.PAUSED.value)
     running = sum(1 for value in statuses.values() if value == StepStatus.RUNNING.value)
-    finished = completed + failed + cancelled
+    finished = completed + failed + cancelled + paused
     lines = [
         title,
         f"模式: {mode}  并发: {max_workers}  用时: {elapsed:.1f}s",
-        f"总进度: {finished}/{total}  completed={completed} failed={failed} cancelled={cancelled} running={running}",
+        f"总进度: {finished}/{total}  completed={completed} failed={failed} cancelled={cancelled} paused={paused} running={running}",
     ]
     if system_text:
         lines.append(system_text)
@@ -3595,7 +4045,7 @@ def _sample_pipeline_progress_text(
     registry = _PathDisplayRegistry()
     total_units = max(1, len(samples) * len(steps))
     completed_units = 0.0
-    running = failed = cancelled = 0
+    running = failed = cancelled = paused = 0
     sample_rows: list[str] = []
     for sample in samples[:80]:
         current_step = steps[0].step_id if steps else ""
@@ -3620,6 +4070,8 @@ def _sample_pipeline_progress_text(
                 failed += 1
             elif value == StepStatus.CANCELLED.value:
                 cancelled += 1
+            elif value == StepStatus.PAUSED.value:
+                paused += 1
             break
         raw_detail = messages.get((sample.sample_id, current_step), "")
         detail = _sample_pipeline_step_detail(sample, current_step, current_status, raw_detail)
@@ -3648,7 +4100,7 @@ def _sample_pipeline_progress_text(
         title,
         f"模式: 按样本流水线  {concurrency_text}  用时: {elapsed:.1f}s",
         f"样本数: {len(samples)}  当前显示: {min(len(samples), 80)}",
-        f"总进度: {_text_progress_bar(overall_percent)} {overall_percent:.1f}%  步骤单位={completed_units:.1f}/{total_units} running={running} failed={failed} cancelled={cancelled}",
+        f"总进度: {_text_progress_bar(overall_percent)} {overall_percent:.1f}%  步骤单位={completed_units:.1f}/{total_units} running={running} failed={failed} cancelled={cancelled} paused={paused}",
     ]
     if system_text:
         lines.append(system_text)
@@ -3680,6 +4132,8 @@ class _RuntimeResourceGuard:
         self.note = ""
         self.triggered = False
         self.last_check = 0.0
+        self.last_resource_log = 0.0
+        self.resource_log_interval = 5.0
 
     def tick(self, statuses: dict[tuple[str, str], str], messages: dict[tuple[str, str], str]) -> str:
         if not self.params.resource_guard_enabled:
@@ -3690,10 +4144,12 @@ class _RuntimeResourceGuard:
             return self.note
         self.last_check = now
         self.snapshot = _system_snapshot_for_params(self.params, self.task, sampler=self.sampler)
+        self._record_resource_snapshot(now)
         disk = self.snapshot.work_disk
         if not disk or disk.warning_level != "critical" or self.triggered:
             self.note = ""
             return ""
+        self._record_disk_guard_trigger(disk)
         if self.params.disk_guard_strategy == "transfer" and self.params.spill_large_outputs:
             if self.task and self.context and self.params.spill_paths:
                 output_dir = _workflow_processing_output_dir(self.task, self.params)
@@ -3728,6 +4184,35 @@ class _RuntimeResourceGuard:
             self.snapshot = _system_snapshot_for_params(self.params, self.task, sampler=self.sampler)
         return _compact_system_snapshot_text(self.snapshot)
 
+    def _record_disk_guard_trigger(self, disk: DiskSnapshot) -> None:
+        if not self.task:
+            return
+        _record_task_event(
+            self.task,
+            "disk_guard_triggered",
+            "disk guard triggered",
+            level="WARNING",
+            strategy=self.params.disk_guard_strategy,
+            spill_large_outputs=self.params.spill_large_outputs,
+            spill_paths=self.params.spill_paths,
+            disk_path=str(disk.path),
+            disk_percent=disk.percent,
+            disk_free_bytes=disk.free_bytes,
+            min_free_gb=self.params.disk_guard_min_free_gb,
+            min_free_percent=self.params.disk_guard_min_free_percent,
+        )
+
+    def _record_resource_snapshot(self, now: float) -> None:
+        if not self.task or self.snapshot is None:
+            return
+        if now - self.last_resource_log < self.resource_log_interval:
+            return
+        self.last_resource_log = now
+        try:
+            _task_log_manager(self.task).resource(**_resource_log_record(self.snapshot))
+        except Exception:
+            pass
+
 
 def _system_snapshot_for_params(params: TaskParams, task: TaskWorkspace | None, sampler: CpuSampler | None = None) -> SystemSnapshot:
     work_path = task.root if task else Path.cwd()
@@ -3738,6 +4223,31 @@ def _system_snapshot_for_params(params: TaskParams, task: TaskWorkspace | None, 
         min_free_gb=params.disk_guard_min_free_gb,
         min_free_percent=params.disk_guard_min_free_percent,
     )
+
+
+def _resource_log_record(snapshot: SystemSnapshot) -> dict[str, Any]:
+    work_disk = snapshot.work_disk
+    memory = snapshot.memory
+    return {
+        "captured_at": snapshot.captured_at,
+        "cpu_percent": snapshot.cpu.percent,
+        "memory_percent": memory.percent,
+        "memory_used_bytes": memory.used_bytes,
+        "memory_available_bytes": memory.available_bytes,
+        "work_disk_path": work_disk.path if work_disk else None,
+        "work_disk_percent": work_disk.percent if work_disk else None,
+        "work_disk_free_bytes": work_disk.free_bytes if work_disk else None,
+        "warning_level": work_disk.warning_level if work_disk else "unknown",
+        "spill_disks": [
+            {
+                "path": disk.path,
+                "percent": disk.percent,
+                "free_bytes": disk.free_bytes,
+                "warning_level": disk.warning_level,
+            }
+            for disk in snapshot.spill_disks
+        ],
+    }
 
 
 def _compact_system_snapshot_text(snapshot: SystemSnapshot) -> str:
@@ -3981,16 +4491,27 @@ def _stable_artifact_candidates(task: TaskWorkspace, active_samples: set[str]) -
 def _record_artifact_location(task: TaskWorkspace, source: Path, target: Path, reason: str) -> None:
     path = _artifact_locations_path(task)
     records = _read_artifact_location_records(task)
+    moved_at = datetime.now().isoformat(timespec="seconds")
     records.append(
         {
             "original_path": str(source),
             "current_path": str(target),
             "task_id": task.task_id,
             "reason": reason,
-            "moved_at": datetime.now().isoformat(timespec="seconds"),
+            "moved_at": moved_at,
         }
     )
     _write_json_atomic(path, records)
+    _record_task_event(
+        task,
+        "artifact_moved",
+        "artifact moved",
+        original_path=str(source),
+        current_path=str(target),
+        reason=reason,
+        moved_at=moved_at,
+        size_bytes=_safe_file_size(target) if target.exists() and target.is_file() else _path_file_count_size(target)[1],
+    )
 
 
 def _record_output_root(task: TaskWorkspace, original_root: Path, current_root: Path, reason: str) -> None:
@@ -4005,8 +4526,18 @@ def _record_output_root(task: TaskWorkspace, original_root: Path, current_root: 
     for record in records:
         if all(record.get(field) == value for field, value in key.items()):
             return
-    records.append({**key, "mapped_at": datetime.now().isoformat(timespec="seconds")})
+    mapped_at = datetime.now().isoformat(timespec="seconds")
+    records.append({**key, "mapped_at": mapped_at})
     _write_json_atomic(path, records)
+    _record_task_event(
+        task,
+        "artifact_moved",
+        "artifact output root mapped",
+        original_path=key["original_path"],
+        current_path=key["current_path"],
+        reason=reason,
+        mapped_at=mapped_at,
+    )
 
 
 def _read_artifact_location_records(task: TaskWorkspace) -> list[dict[str, Any]]:
@@ -4708,6 +5239,7 @@ def _edit_config_execution_page(state: TuiState, data: dict[str, Any]) -> None:
         "docker_image": str(data.get("docker_image") or "rnaseq-workflow:tools"),
         "max_workers": int(data.get("max_workers") or DEFAULT_TUI_CONCURRENCY),
         "fastqc_threads": int(data.get("fastqc_threads") or 2),
+        "trimmed_fastqc_policy": str(data.get("trimmed_fastqc_policy") or "run_keep"),
         "trim_galore_cores": int(data.get("trim_galore_cores") or 1),
         "hisat2_threads": int(data.get("hisat2_threads") or 4),
         "samtools_threads": int(data.get("samtools_threads") or 2),
@@ -4718,6 +5250,7 @@ def _edit_config_execution_page(state: TuiState, data: dict[str, Any]) -> None:
         ("docker_image", "Docker 镜像", "仅 Docker 模式使用。"),
         ("max_workers", "样本并发数", "同时处理的样本数。"),
         ("fastqc_threads", "FastQC 线程数", "单个 FastQC 任务使用的线程数。"),
+        ("trimmed_fastqc_policy", "二次质控策略", "run_keep 保留结果；pause_on_fail 异常时暂停样本；disabled 不运行。"),
         ("trim_galore_cores", "Trim Galore cores", "单个样本修剪时使用的核心数。"),
         ("hisat2_threads", "HISAT2 线程数", "单个样本比对时使用的线程数。"),
         ("samtools_threads", "Samtools 线程数", "BAM 排序和索引使用的线程数。"),
@@ -8302,6 +8835,7 @@ def _print_step_results(console: Console, results: list[StepResult], title: str)
             StepStatus.COMPLETED: "green",
             StepStatus.FAILED: "red",
             StepStatus.CANCELLED: "yellow",
+            StepStatus.PAUSED: "yellow",
             StepStatus.SKIPPED: "cyan",
         }.get(result.status, "white")
         table.add_row(

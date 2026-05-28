@@ -10,6 +10,9 @@ class StateRepository(Protocol):
     def get_step_record(self, sample_id: str, step_id: str) -> StepRecord | None:
         ...
 
+    def get_sample_pause_record(self, sample_id: str) -> StepRecord | None:
+        ...
+
     def mark_running(self, sample: Sample, step: PipelineStep) -> None:
         ...
 

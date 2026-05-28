@@ -97,7 +97,7 @@ def print_run_summary(console: Console, state_path: Path) -> None:
         state = json.load(handle)
 
     samples: dict[str, Any] = state.get("samples", {})
-    counts = {"COMPLETED": 0, "FAILED": 0, "RUNNING": 0, "SKIPPED": 0, "CANCELLED": 0, "PENDING": 0}
+    counts = {"COMPLETED": 0, "FAILED": 0, "RUNNING": 0, "SKIPPED": 0, "CANCELLED": 0, "PAUSED": 0, "PENDING": 0}
     for sample_data in samples.values():
         for step in sample_data.get("steps", {}).values():
             status = str(step.get("status", "PENDING"))
@@ -111,6 +111,7 @@ def print_run_summary(console: Console, state_path: Path) -> None:
     summary.add_row("completed", str(counts.get("COMPLETED", 0)))
     summary.add_row("failed", str(counts.get("FAILED", 0)))
     summary.add_row("skipped", str(counts.get("SKIPPED", 0)))
+    summary.add_row("paused", str(counts.get("PAUSED", 0)))
     console.print(summary)
 
     detail = Table(title="Sample Steps", box=box.SIMPLE)

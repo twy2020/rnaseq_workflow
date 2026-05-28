@@ -12,6 +12,7 @@ EXECUTION_MODES = {"sample_pipeline", "stage_batch"}
 CLEANUP_POLICIES = {"cleanup_after_task", "cleanup_after_step", "no_auto_cleanup"}
 DISK_GUARD_STRATEGIES = {"cancel", "transfer"}
 EXPRESSION_OUTPUT_FORMATS = {"raw_counts", "cpm", "fpkm", "tpm", "stringtie_fpkm", "stringtie_tpm"}
+TRIMMED_FASTQC_POLICIES = {"run_keep", "pause_on_fail", "disabled"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class TaskParams:
     download_proxy: str = ""
     sra_threads: int = 4
     fastqc_threads: int = 2
+    trimmed_fastqc_policy: str = "run_keep"
     trim_quality: int = 20
     trim_cores: int = 1
     hisat2_threads: int = 4
@@ -101,6 +103,8 @@ def validate_task_params(params: TaskParams) -> list[ParamIssue]:
             issues.append(ParamIssue(field, "must be >= 1"))
     if not 0 <= int(params.trim_quality) <= 40:
         issues.append(ParamIssue("trim_quality", "must be between 0 and 40"))
+    if params.trimmed_fastqc_policy not in TRIMMED_FASTQC_POLICIES:
+        issues.append(ParamIssue("trimmed_fastqc_policy", "must be run_keep, pause_on_fail, or disabled"))
     if int(params.featurecounts_strandness) not in {0, 1, 2}:
         issues.append(ParamIssue("featurecounts_strandness", "must be 0, 1, or 2"))
     if not params.expression_output_formats:
