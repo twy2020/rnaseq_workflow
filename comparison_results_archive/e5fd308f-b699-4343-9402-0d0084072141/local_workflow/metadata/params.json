@@ -1,0 +1,55 @@
+{
+  "execution_mode": "sample_pipeline",
+  "cleanup_policy": "cleanup_after_task",
+  "max_workers": 4,
+  "download_workers": 4,
+  "docker_image": "rnaseq-workflow:tools",
+  "docker_workspace": "workspace",
+  "download_source": "sra",
+  "download_max_size": "5G",
+  "download_proxy": "",
+  "sra_threads": 4,
+  "fastqc_threads": 4,
+  "trimmed_fastqc_policy": "run_keep",
+  "trim_quality": 20,
+  "trim_cores": 4,
+  "hisat2_threads": 4,
+  "samtools_threads": 4,
+  "featurecounts_threads": 4,
+  "featurecounts_feature_type": "exon",
+  "featurecounts_attribute_type": "gene_id",
+  "featurecounts_strandness": 0,
+  "featurecounts_paired": true,
+  "stringtie_threads": 4,
+  "expression_output_formats": [
+    "raw_counts",
+    "stringtie_fpkm"
+  ],
+  "reference_id": "arabidopsis_thaliana",
+  "reference_dir": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\references",
+  "hisat2_index": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\references\\arabidopsis_thaliana\\hisat2\\genome",
+  "annotation": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\references\\arabidopsis_thaliana\\annotation.gtf",
+  "downloads_dir": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\downloads",
+  "output_dir": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141",
+  "reports_dir": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\reports",
+  "resource_estimate": {
+    "sample_count": 4,
+    "input_file_count": 8,
+    "input_size_bytes": 8812806237,
+    "estimated_output_bytes": 26438418711,
+    "estimated_peak_workspace_bytes": 39657628066,
+    "recommended_free_bytes": 39657628066,
+    "notes": [
+      "估算基于输入体量和常见 RNA-seq 中间产物倍率。",
+      "HISAT2 SAM、排序 BAM 和临时文件可能短时占用较多空间。"
+    ]
+  },
+  "resource_guard_enabled": true,
+  "disk_guard_min_free_gb": 20.0,
+  "disk_guard_min_free_percent": 10.0,
+  "disk_guard_strategy": "transfer",
+  "spill_paths": [
+    "H:\\rnaseq"
+  ],
+  "spill_large_outputs": true
+}

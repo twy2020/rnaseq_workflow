@@ -1,0 +1,10 @@
+{
+  "user_id": "657a87c7-2896-4a3e-be29-8b7c6e7cc353",
+  "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+  "task_name": "test2",
+  "description": "test",
+  "created_at": "2026-05-15T22:07:00",
+  "status": "created",
+  "reference_id": "glycine_max",
+  "sample_groups": []
+}

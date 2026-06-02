@@ -1,0 +1,135 @@
+[
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "large_outputs_root",
+    "mapped_at": "2026-05-16T00:41:16"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\alignment",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\alignment",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:43:36"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\qc_raw",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\qc_raw",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:43:36"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\quantification",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\quantification",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:43:36"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\raw_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\raw_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:44:00"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\trimmed_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047174\\trimmed_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:44:09"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\alignment",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\alignment",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:44:45"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\qc_raw",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\qc_raw",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:44:45"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\quantification",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\quantification",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:44:45"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\raw_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\raw_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:45:15"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\trimmed_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047173\\trimmed_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:45:18"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\alignment",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\alignment",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:45:47"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\qc_raw",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\qc_raw",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:45:47"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\raw_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\raw_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:46:13"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\trimmed_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047175\\trimmed_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:46:19"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\alignment",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\alignment",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:46:47"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\qc_raw",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\qc_raw",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:46:47"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\raw_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\raw_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:47:32"
+  },
+  {
+    "original_path": "workspace\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\trimmed_fastq",
+    "current_path": "H:\\rnaseq\\users\\657a87c7-2896-4a3e-be29-8b7c6e7cc353\\tasks\\e5fd308f-b699-4343-9402-0d0084072141\\samples\\SRR11047176\\trimmed_fastq",
+    "task_id": "e5fd308f-b699-4343-9402-0d0084072141",
+    "reason": "disk_guard_spill_existing",
+    "moved_at": "2026-05-16T00:47:39"
+  }
+]

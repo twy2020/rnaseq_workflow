@@ -1,0 +1,65 @@
+{
+  "checks": [
+    {
+      "name": "cpu",
+      "level": "info",
+      "ok": true,
+      "message": "cores=16",
+      "recommendation": "CPU 核心数可满足常规小样本验证。"
+    },
+    {
+      "name": "memory",
+      "level": "info",
+      "ok": true,
+      "message": "total=63.9GB",
+      "recommendation": "内存满足常规流程验证。"
+    },
+    {
+      "name": "disk",
+      "level": "info",
+      "ok": true,
+      "message": "free=124.1GB recommended>=36.9GB",
+      "recommendation": "磁盘空间满足当前估算。"
+    },
+    {
+      "name": "docker",
+      "level": "info",
+      "ok": true,
+      "message": "Docker version 29.1.3, build f52814d",
+      "recommendation": "工具可用。"
+    },
+    {
+      "name": "network",
+      "level": "info",
+      "ok": true,
+      "message": "www.ncbi.nlm.nih.gov:443 reachable",
+      "recommendation": "网络连通。"
+    },
+    {
+      "name": "docker image",
+      "level": "error",
+      "ok": false,
+      "message": "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.",
+      "recommendation": "请检查工具安装、Docker 服务或镜像名称。"
+    },
+    {
+      "name": "docker tool:stringtie",
+      "level": "error",
+      "ok": false,
+      "message": "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine; check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.",
+      "recommendation": "请重建镜像：docker build -f docker/Dockerfile.tools -t rnaseq-workflow:tools ."
+    }
+  ],
+  "estimate": {
+    "sample_count": 4,
+    "input_file_count": 8,
+    "input_size_bytes": 8812806237,
+    "estimated_output_bytes": 26438418711,
+    "estimated_peak_workspace_bytes": 39657628066,
+    "recommended_free_bytes": 39657628066,
+    "notes": [
+      "估算基于输入体量和常见 RNA-seq 中间产物倍率。",
+      "HISAT2 SAM、排序 BAM 和临时文件可能短时占用较多空间。"
+    ]
+  }
+}
