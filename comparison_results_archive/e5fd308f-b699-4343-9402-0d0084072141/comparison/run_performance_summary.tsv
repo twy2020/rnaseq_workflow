@@ -1,3 +1,0 @@
-workflow	wall_time	max_memory	output_dir_size	notes
-nf-core/rnaseq 3.26.0	7253s	3.4GB	22.5GB	Nextflow Docker run; max_memory configured 20.GB; trace file records per-step resources
-本文系统	未在本次对比目录完整计时	未在本次对比目录完整采集	175.5GB	用于结果一致性对比的既有本地流程输出；如需性能表，应用同一批 FASTQ 重新计时运行

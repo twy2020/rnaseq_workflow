@@ -43,6 +43,8 @@ outputs/
 reports/
 tmp/
 temp/
+manuscript_jbcb/
+comparison_results_archive/
 
 # Downloaded sequencing data and workflow intermediates
 *.sra

@@ -1,6 +1,0 @@
-item	value
-local_stringtie_fpkm	H:\rnaseq\users\657a87c7-2896-4a3e-be29-8b7c6e7cc353\tasks\e5fd308f-b699-4343-9402-0d0084072141\reports\stringtie_fpkm.tsv
-nfcore_stringtie_sources	F:\rnaseq_nfcore_compare\e5fd308f-b699-4343-9402-0d0084072141\nfcore_rnaseq_out\hisat2\stringtie\*.gene.abundance.txt
-metric	StringTie gene-level FPKM
-samples	SRR11047173,SRR11047174,SRR11047175,SRR11047176
-note	nf-core StringTie FPKM matrix was rebuilt from per-sample gene.abundance.txt files.

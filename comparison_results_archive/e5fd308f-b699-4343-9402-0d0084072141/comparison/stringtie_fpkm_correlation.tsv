@@ -1,2 +1,0 @@
-common_genes	common_samples	pearson	spearman	mean_abs_diff	max_abs_diff	local_matrix	nfcore_matrix
-32833	4	0.998481	0.985404	0.465812	875.120605	H:\rnaseq\users\657a87c7-2896-4a3e-be29-8b7c6e7cc353\tasks\e5fd308f-b699-4343-9402-0d0084072141\reports\stringtie_fpkm.tsv	F:\rnaseq_nfcore_compare\e5fd308f-b699-4343-9402-0d0084072141\comparison\nfcore_stringtie_fpkm.tsv

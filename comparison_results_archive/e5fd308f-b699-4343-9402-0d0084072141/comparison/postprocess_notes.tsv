@@ -1,5 +1,0 @@
-item	value
-nfcore_featurecounts_command	featureCounts -T 4 -a /work/ref/annotation.gtf -o /work/nfcore_featurecounts/nfcore.featureCounts.txt -t exon -g gene_id -s 0 -p /work/nfcore_rnaseq_out/hisat2/*.sorted.bam
-nfcore_featurecounts_image	rnaseq-workflow:tools; featureCounts v2.0.6
-nfcore_trace	F:\rnaseq_nfcore_compare\e5fd308f-b699-4343-9402-0d0084072141\nfcore_rnaseq_out\pipeline_info\execution_trace_2026-05-19_04-30-38.txt
-resource_monitor	F:\rnaseq_nfcore_compare\e5fd308f-b699-4343-9402-0d0084072141\monitoring\resource_monitor_20260519_125931.tsv
