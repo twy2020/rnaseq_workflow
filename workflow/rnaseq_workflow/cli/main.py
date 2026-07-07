@@ -642,7 +642,12 @@ def run(
     print_run_summary(console, state_path)
     if finalize:
         try:
-            result = finalize_project(cfg.project_id, cfg.output_dir, samples)
+            result = finalize_project(
+                cfg.project_id,
+                cfg.output_dir,
+                samples,
+                output_formats=cfg.settings.get("expression_output_formats"),
+            )
         except FileNotFoundError as exc:
             print_error(console, f"Finalize error: {exc}")
             raise typer.Exit(code=1) from exc
@@ -1326,6 +1331,7 @@ def finalize_command(
             counts_matrix=counts_matrix,
             report_json=json_output,
             report_markdown=markdown_output,
+            output_formats=cfg.settings.get("expression_output_formats"),
         )
     except FileNotFoundError as exc:
         print_error(console, f"Finalize error: {exc}")

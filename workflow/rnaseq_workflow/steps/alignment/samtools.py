@@ -32,6 +32,16 @@ class SamtoolsSortStep:
 
     def validate_inputs(self, sample: Sample, context: RunContext) -> None:
         sam_input = _sam_path(sample, context)
+        bam_output = project_paths(context.output_dir).alignment_dir(sample) / f"{sample.sample_id}.sorted.bam"
+        index_output = Path(str(bam_output) + ".bai")
+        if (
+            bool(context.config.get("hisat2_sort_bam", False))
+            and not context.dry_run
+            and bam_output.exists()
+            and bam_output.stat().st_size > 0
+            and (not context.config.get("samtools_index", True) or (index_output.exists() and index_output.stat().st_size > 0))
+        ):
+            return
         if not context.dry_run and not sam_input.exists():
             raise FileNotFoundError(f"SAM file not found: {sam_input}")
 

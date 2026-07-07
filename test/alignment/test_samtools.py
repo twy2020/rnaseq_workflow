@@ -55,3 +55,27 @@ def test_samtools_sort_uses_sample_sam_path_for_tui_scan(tmp_path):
     assert result.status == StepStatus.COMPLETED
     assert result.command is not None
     assert str(sam) in result.command
+
+
+def test_samtools_sort_skips_when_hisat2_direct_sort_created_bam(tmp_path):
+    sample = Sample(sample_id="S1", source_path=tmp_path / "S1.fastq")
+    alignment_dir = tmp_path / "output" / "samples" / "S1" / "alignment"
+    alignment_dir.mkdir(parents=True)
+    bam = alignment_dir / "S1.sorted.bam"
+    bai = alignment_dir / "S1.sorted.bam.bai"
+    bam.write_bytes(b"bam")
+    bai.write_bytes(b"bai")
+    context = RunContext(
+        project_id="demo",
+        work_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        config={"hisat2_sort_bam": True},
+        dry_run=False,
+    )
+
+    step = SamtoolsSortStep()
+    step.validate_inputs(sample, context)
+    result = step.run(sample, context)
+
+    assert result.status == StepStatus.SKIPPED
+    assert result.extra["skipped_existing"] is True

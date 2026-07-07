@@ -34,6 +34,16 @@ from rich.console import Console
 from rich.table import Table
 
 from rnaseq_workflow.cli.interactive import run_interactive_console
+from rnaseq_workflow.cli.i18n import (
+    default_language,
+    get_language,
+    language_name,
+    language_status,
+    normalize_language,
+    set_language,
+    translate,
+    translate_values,
+)
 from rnaseq_workflow.cli.ui import (
     print_config_summary,
     print_doctor_checks,
@@ -171,6 +181,15 @@ STYLE = Style.from_dict(
 
 KEY_HINT = "↑↓ 选择    Enter 确认    Esc 返回"
 LINE_MODE_ENV = "RNASEQ_TUI_MODE"
+UI_SETTINGS_FILE = "ui_settings.json"
+
+
+def _ui(text: object) -> str:
+    return translate(text)
+
+
+def _ui_values(values: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return translate_values(values)
 
 
 @dataclass
@@ -183,6 +202,7 @@ class TuiState:
     task_id: str | None = None
     username: str | None = None
     session_id: str | None = None
+    language: str = "zh"
 
     @property
     def workspace(self) -> AssetWorkspace:
@@ -199,8 +219,9 @@ def run_tui(console: Console, default_config: Path = Path("config.yaml"), fallba
     if fallback_when_not_tty and not _is_interactive_terminal():
         run_interactive_console(console, default_config=default_config)
         return
-    state = TuiState(config=default_config, console=console)
+    state = TuiState(config=default_config, console=console, language=default_language())
     _load_saved_session(state)
+    set_language(state.language)
     while True:
         choice = _menu(
             "RNA-seq Workflow",
@@ -213,6 +234,7 @@ def run_tui(console: Console, default_config: Path = Path("config.yaml"), fallba
                 ("reference", "Reference"),
                 ("tools", "工具调试"),
                 ("system", "系统信息与资源策略"),
+                ("language", f"Language / 语言: {language_status(state.language)}"),
                 ("output", "查看最近输出"),
                 ("exit", "退出"),
             ],
@@ -230,8 +252,9 @@ def _home_status_text(state: TuiState) -> str:
             f"任务: {_current_task_display(state)}",
             f"配置: {state.config}",
             f"目录: {Path.cwd()}",
+            f"界面语言: {language_status(state.language)}",
             "",
-            "从用户与任务管理开始。",
+            "从任务开始。",
         ]
     )
 
@@ -245,6 +268,7 @@ def _dispatch(choice: str, state: TuiState) -> None:
         "reference": _reference_menu,
         "tools": _tools_menu,
         "system": _system_resource_menu,
+        "language": _language_menu,
         "download": _download_menu,
         "advanced_download": _advanced_download_menu,
         "metadata": _metadata_menu,
@@ -264,6 +288,23 @@ def _dispatch(choice: str, state: TuiState) -> None:
     action = actions.get(choice)
     if action:
         action(state)
+
+
+def _language_menu(state: TuiState) -> None:
+    choice = _menu(
+        "切换界面语言",
+        "选择你想使用的语言。",
+        [
+            ("zh", "中文"),
+            ("en", "English"),
+            ("back", "返回"),
+        ],
+    )
+    if choice in (None, "back"):
+        return
+    state.language = set_language(choice)
+    _save_ui_settings(state)
+    _message("语言", f"界面语言: {language_name(state.language)}")
 
 
 def _doctor(state: TuiState) -> None:
@@ -303,7 +344,7 @@ def _tools_menu(state: TuiState) -> None:
     while True:
         choice = _menu(
             "工具调试",
-            "单项工具入口用于排错和局部重跑；正式任务建议使用 Workflow。",
+            "需要时单独运行一步。",
             [
                 ("download", "下载 SRA"),
                 ("advanced_download", "高级下载设置"),
@@ -492,6 +533,8 @@ def _task_management_menu(state: TuiState) -> None:
 
 
 def _load_saved_session(state: TuiState) -> None:
+    state.language = _load_ui_language(state)
+    set_language(state.language)
     try:
         session = state.workspace.load_session()
         user = state.workspace.database.get_session_user(session.get("session_id") if session else None)
@@ -502,6 +545,35 @@ def _load_saved_session(state: TuiState) -> None:
         state.user_id = user.user_id
         state.username = user.username
         state.workspace.ensure_user(user.user_id)
+
+
+def _ui_settings_path(state: TuiState) -> Path:
+    return state.workspace.root / UI_SETTINGS_FILE
+
+
+def _load_ui_language(state: TuiState) -> str:
+    env_language = os.environ.get("RNASEQ_UI_LANG")
+    if env_language:
+        return normalize_language(env_language)
+    path = _ui_settings_path(state)
+    if not path.exists():
+        return normalize_language(state.language)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return normalize_language(state.language)
+    return normalize_language(data.get("language", state.language))
+
+
+def _save_ui_settings(state: TuiState) -> None:
+    try:
+        state.workspace.ensure()
+        _ui_settings_path(state).write_text(
+            json.dumps({"language": normalize_language(state.language)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        return
 
 
 def _register_user(state: TuiState) -> DbUser | None:
@@ -8375,7 +8447,7 @@ def _choose_fastqc_target(samples: list[Sample]) -> list[Sample] | None:
 def _sample_multiselect(title: str, samples: list[Sample]) -> list[Sample] | None:
     values = [(sample.sample_id, _sample_label(sample)) for sample in samples]
     if _use_line_dialogs():
-        selected_ids = _line_multiselect(title, values, default_values=[sample.sample_id for sample in samples])
+        selected_ids = _line_multiselect(_ui(title), values, default_values=[sample.sample_id for sample in samples])
         if selected_ids is None:
             return None
         selected = set(selected_ids)
@@ -8387,12 +8459,12 @@ def _sample_multiselect(title: str, samples: list[Sample]) -> list[Sample] | Non
             return []
         return selected_samples
     selected_ids = checkboxlist_dialog(
-        title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
+        title=HTML(f"<b><ansicyan>{_ui(title)}</ansicyan></b>"),
         text=_dialog_text("空格勾选或取消。", include_multiselect=True),
         values=[(value, HTML(_escape_html(label))) for value, label in values],
         default_values=[sample.sample_id for sample in samples],
-        ok_text="确认 Enter",
-        cancel_text="返回 Esc",
+        ok_text=_ui("确认 Enter"),
+        cancel_text=_ui("返回 Esc"),
         style=STYLE,
     ).run()
     if selected_ids is None:
@@ -8414,9 +8486,11 @@ def _option_multiselect(
     default_values: list[str] | None = None,
 ) -> list[str] | None:
     defaults = list(default_values or [])
+    title, text = _ui(title), _ui(text or "空格勾选或取消。")
+    values = _ui_values(values)
     if _use_line_dialogs():
         return _line_multiselect(title, values, default_values=defaults)
-    return _keyboard_multiselect(title, text or "空格勾选或取消。", values, defaults)
+    return _keyboard_multiselect(title, text, values, defaults)
 
 
 def _keyboard_multiselect(
@@ -8485,7 +8559,7 @@ def _keyboard_multiselect(
         start = _scroll_window_start(len(values), selected["index"], visible_options)
         end = min(len(values), start + visible_options)
         if start:
-            fragments.append(("class:dialog.body", f"... 上方还有 {start} 项\n"))
+            fragments.append(("class:dialog.body", _ui(f"... 上方还有 {start} 项") + "\n"))
         for index in range(start, end):
             value, label = values[index]
             active = index == selected["index"]
@@ -8495,17 +8569,17 @@ def _keyboard_multiselect(
             handler = option_mouse_handler(index)
             fragments.append((style, f"{prefix}{checked} {label}\n", handler))
         if end < len(values):
-            fragments.append(("class:dialog.body", f"... 下方还有 {len(values) - end} 项\n"))
+            fragments.append(("class:dialog.body", _ui(f"... 下方还有 {len(values) - end} 项") + "\n"))
         fragments.append(("", "\n"))
-        fragments.append(("class:dialog.body", "Space 勾选/取消，Enter 确认，Esc 返回。"))
+        fragments.append(("class:dialog.body", _ui("Space 勾选/取消，Enter 确认，Esc 返回。")))
         return FormattedText(fragments)
 
     def render_buttons():
         return FormattedText(
             [
-                ("class:menu.border", "< 确认 Enter >", button_mouse_handler("accept")),
+                ("class:menu.border", f"< {_ui('确认 Enter')} >", button_mouse_handler("accept")),
                 ("class:dialog.body", " "),
-                ("class:menu.border", "< 返回 Esc >", button_mouse_handler("cancel")),
+                ("class:menu.border", f"< {_ui('返回 Esc')} >", button_mouse_handler("cancel")),
             ]
         )
 
@@ -9031,6 +9105,9 @@ def _show_reference_dialog(reference_dir: Path, reference_id: str) -> None:
 
 
 def _menu(title: str, text: str, values: list[tuple[str, str]]) -> str | None:
+    title = _ui(title)
+    text = _ui(text)
+    values = _ui_values(values)
     if _use_line_dialogs():
         return _line_menu(title, text, values)
     return _keyboard_menu(title, text, values)
@@ -9038,15 +9115,17 @@ def _menu(title: str, text: str, values: list[tuple[str, str]]) -> str | None:
 
 def _input(title: str, text: str, default: str = "") -> str | None:
     if _use_line_dialogs():
-        return _line_input(title, text, default)
+        return _line_input(_ui(title), _ui(text), default)
     title, text = _friendly_field(title, text)
+    title, text = _ui(title), _ui(text)
     return _text_input_dialog(title, text, default=default, password=False)
 
 
 def _password_input(title: str, text: str) -> str | None:
     if _use_line_dialogs():
-        return _line_password_input(title, text)
+        return _line_password_input(_ui(title), _ui(text))
     title, text = _friendly_field(title, text)
+    title, text = _ui(title), _ui(text)
     return _text_input_dialog(title, text, default="", password=True)
 
 
@@ -9076,11 +9155,11 @@ def _text_input_dialog(title: str, text: str, default: str = "", password: bool 
         body=HSplit(
             [
                 Box(
-                    Frame(text_area, title=HTML("<ansicyan>输入</ansicyan>"), width=Dimension(preferred=68)),
+                    Frame(text_area, title=HTML(f"<ansicyan>{_ui('输入')}</ansicyan>"), width=Dimension(preferred=68)),
                     padding_top=0,
                     padding_bottom=1,
                 ),
-                Label(text=f"说明: {_short_hint(text)}"),
+                Label(text=f"{_ui('说明')}: {_short_hint(text)}"),
                 Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
             ],
             padding=1,
@@ -9109,7 +9188,8 @@ def _text_input_dialog(title: str, text: str, default: str = "", password: bool 
 
 def _multiline_input(title: str, text: str, default: str = "", completer=None) -> str | None:
     if _use_line_dialogs():
-        return _line_multiline_input(title, text, default)
+        return _line_multiline_input(_ui(title), _ui(text), default)
+    title, text = _ui(title), _ui(text)
 
     result = {"value": None}
     text_area = TextArea(
@@ -9123,15 +9203,15 @@ def _multiline_input(title: str, text: str, default: str = "", completer=None) -
         completer=completer,
     )
 
-    button_control = _dialog_button_control(lambda: text_area.text, accept_label="确认 F2/Ctrl+S")
+    button_control = _dialog_button_control(lambda: text_area.text, accept_label=_ui("确认 F2/Ctrl+S"))
 
     dialog = Dialog(
         title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
         body=HSplit(
             [
                 text_area,
-                Label(text=f"说明: {_short_hint(text)}"),
-                Label(text="Enter 会换行。"),
+                Label(text=f"{_ui('说明')}: {_short_hint(text)}"),
+                Label(text=_ui("Enter 会换行。")),
                 Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
             ],
             padding=1,
@@ -9187,52 +9267,54 @@ def _path_input(
 def _friendly_field(title: str, text: str = "") -> tuple[str, str]:
     key = str(title).strip()
     mapping = {
-        "docker_workspace": ("Docker 工作目录", "容器可访问的项目目录。默认 . 表示当前目录。"),
-        "docker_image": ("Docker 镜像", "包含流程工具的容器镜像。"),
-        "工具镜像": ("Docker 镜像", "包含流程工具的容器镜像。"),
-        "execution_mode": ("执行方式", "Docker 更稳定；Local 使用本机工具。"),
-        "download_source": ("下载来源", "Auto 会优先选择可用来源。"),
-        "download max_size": ("下载大小上限", "SRA Toolkit 的 max-size 参数。"),
-        "download_proxy": ("下载代理", "仅下载阶段使用。留空表示直连；需要代理时填写本机代理地址。"),
-        "max_size": ("下载大小上限", "可使用 5G、20G 等格式。"),
-        "project_id": ("项目 ID", "用于报告、日志和输出命名。"),
-        "project_id，可留空": ("项目 ID", "留空时使用默认名称。"),
-        "reference_id": ("Reference ID", "参考资产的唯一名称。"),
-        "species": ("物种名称", "使用来源数据库接受的物种名。"),
-        "division": ("Ensembl 分库", "植物选择 plants；动物常用 vertebrates。"),
-        "release": ("版本", "可使用 current 或指定版本。"),
-        "provider": ("来源", "记录参考文件来源。"),
-        "annotation_provider": ("注释来源", "默认与参考来源一致。"),
-        "accession": ("SRA 编号", "输入一个 SRR、ERR 或 DRR 编号。"),
-        "feature type (-t)": ("featureCounts 特征类型", "GTF 常用 exon；GFF 可按注释选择 gene。"),
-        "attribute type (-g)": ("featureCounts 属性字段", "GTF 常用 gene_id；部分 GFF 使用 gene 或 ID。"),
-        "featureCounts -t": ("featureCounts 特征类型", "GTF 常用 exon；GFF 可按注释选择 gene。"),
-        "featureCounts -g": ("featureCounts 属性字段", "GTF 常用 gene_id；部分 GFF 使用 gene 或 ID。"),
-        "featureCounts -s": ("链特异性", "0 非链特异，1 正向，2 反向。"),
-        "下载并发数": ("下载并发数", "同时下载的样本数量。网络不稳定时使用 1 到 2；链路稳定时再提高。"),
-        "工作流样本并发数": ("工作流样本并发数", "同时处理的样本数量。值越大占用 CPU、内存和磁盘 I/O 越多。"),
-        "样本并发数": ("样本并发数", "同时处理的样本数量。值越大占用 CPU、内存和磁盘 I/O 越多；默认通常足够。"),
-        "fasterq-dump 线程数": ("SRA 转 FASTQ 线程数", "单个样本转换时使用的线程数。提高后会更快，也会增加临时磁盘和 CPU 占用。"),
-        "FastQC 线程数": ("FastQC 线程数", "单个 FastQC 任务使用的线程数。FastQC 通常不需要很高，2 到 4 较稳妥。"),
-        "Trim quality": ("修剪质量阈值", "Trim Galore 去除低质量碱基的阈值。20 是常用默认值；更高会更严格。"),
-        "quality": ("修剪质量阈值", "Trim Galore 去除低质量碱基的阈值。20 是常用默认值；更高会更严格。"),
-        "Trim Galore cores": ("Trim Galore 核心数", "单个样本修剪时使用的核心数。该值过高会明显增加内存和 I/O 压力。"),
-        "HISAT2 线程数": ("HISAT2 线程数", "单个样本比对时使用的线程数。提高后通常更快，但会增加 CPU 占用。"),
-        "Samtools 线程数": ("Samtools 线程数", "BAM 排序和索引时使用的线程数。排序阶段也会占用较多磁盘 I/O。"),
-        "samtools sort 线程数": ("Samtools 排序线程数", "BAM 排序使用的线程数。提高后更快，也会增加内存和磁盘 I/O。"),
-        "featureCounts 线程数": ("featureCounts 线程数", "定量计数使用的线程数。通常 2 到 4 足够，过高收益有限。"),
-        "链特异性": ("链特异性", "featureCounts 的 -s 参数。0 非链特异，1 正向，2 反向；不确定时先用 0。"),
-        "按片段计数 paired reads": ("按片段计数", "paired-end 数据通常开启。开启后 featureCounts 以 read pair 作为一个片段计数。"),
-        "使用 paired fragments (-p)": ("按片段计数", "paired-end 数据通常开启。开启后 featureCounts 以 read pair 作为一个片段计数。"),
-        "失败重试次数": ("失败重试次数", "下载失败后的自动重试次数。网络不稳定时可设为 1 到 3。"),
-        "清单并发数": ("下载并发数", "同时下载的目标数量。值越大对网络和磁盘压力越高。"),
-        "hisat2-build 线程数": ("HISAT2 建索引线程数", "构建索引时使用的线程数。植物大基因组会占用较多内存。"),
-        "线程数": ("线程数", "当前工具使用的线程数量。提高后可能更快，也会占用更多资源。"),
+        "docker_workspace": ("Docker 工作目录", "容器能访问的项目目录。"),
+        "docker_image": ("Docker 镜像", "选择流程工具镜像。"),
+        "工具镜像": ("Docker 镜像", "选择流程工具镜像。"),
+        "execution_mode": ("执行方式", "Docker 更稳，本机更轻。"),
+        "download_source": ("下载来源", "Auto 会自动选择。"),
+        "download max_size": ("下载大小上限", "例如 5G 或 20G。"),
+        "download_proxy": ("下载代理", "留空表示直连。"),
+        "max_size": ("下载大小上限", "例如 5G 或 20G。"),
+        "project_id": ("项目 ID", "用于标记本次分析。"),
+        "project_id，可留空": ("项目 ID", "留空则使用默认名称。"),
+        "reference_id": ("Reference ID", "给参考资产取个名字。"),
+        "species": ("物种名称", "使用数据库接受的名称。"),
+        "division": ("Ensembl 分库", "植物选 plants。"),
+        "release": ("版本", "可填 current。"),
+        "provider": ("来源", "记录文件来源。"),
+        "annotation_provider": ("注释来源", "可与参考来源一致。"),
+        "accession": ("SRA 编号", "输入 SRR、ERR 或 DRR。"),
+        "feature type (-t)": ("featureCounts 特征类型", "GTF 通常选 exon。"),
+        "attribute type (-g)": ("featureCounts 属性字段", "GTF 通常选 gene_id。"),
+        "featureCounts -t": ("featureCounts 特征类型", "GTF 通常选 exon。"),
+        "featureCounts -g": ("featureCounts 属性字段", "GTF 通常选 gene_id。"),
+        "featureCounts -s": ("链特异性", "不确定时选 0。"),
+        "下载并发数": ("下载并发数", "网络不稳时用 1-2。"),
+        "工作流样本并发数": ("样本并发数", "越大占用越多资源。"),
+        "样本并发数": ("样本并发数", "越大占用越多资源。"),
+        "fasterq-dump 线程数": ("SRA 转 FASTQ 线程数", "更高会更快，也更占资源。"),
+        "FastQC 线程数": ("FastQC 线程数", "2-4 通常足够。"),
+        "Trim quality": ("修剪质量阈值", "20 是常用默认值。"),
+        "quality": ("修剪质量阈值", "20 是常用默认值。"),
+        "Trim Galore cores": ("Trim Galore 核心数", "过高会增加 I/O 压力。"),
+        "HISAT2 线程数": ("HISAT2 线程数", "越高越快，也更占 CPU。"),
+        "Samtools 线程数": ("Samtools 线程数", "排序会占用较多 I/O。"),
+        "samtools sort 线程数": ("Samtools 排序线程数", "排序会占用较多 I/O。"),
+        "featureCounts 线程数": ("featureCounts 线程数", "2-4 通常足够。"),
+        "链特异性": ("链特异性", "不确定时先选 0。"),
+        "按片段计数 paired reads": ("按片段计数", "paired-end 通常开启。"),
+        "使用 paired fragments (-p)": ("按片段计数", "paired-end 通常开启。"),
+        "失败重试次数": ("失败重试次数", "网络不稳时设为 1-3。"),
+        "清单并发数": ("下载并发数", "越大网络压力越高。"),
+        "hisat2-build 线程数": ("HISAT2 建索引线程数", "大基因组会占更多内存。"),
+        "线程数": ("线程数", "越高越快，也更占资源。"),
     }
     return mapping.get(key, (title, text))
 
 
 def _dialog_button_control(get_accept_value: Callable[[], str | None], accept_label: str = "确认 Enter") -> FormattedTextControl:
+    accept_label = _ui(accept_label)
+
     def mouse_handler(action: str):
         def handle(mouse_event: MouseEvent) -> None:
             if mouse_event.event_type == MouseEventType.MOUSE_UP:
@@ -9250,7 +9332,7 @@ def _dialog_button_control(get_accept_value: Callable[[], str | None], accept_la
             [
                 ("class:menu.border", f"< {accept_label} >", mouse_handler("accept")),
                 ("class:dialog.body", " "),
-                ("class:menu.border", "< 返回 Esc >", mouse_handler("cancel")),
+                ("class:menu.border", f"< {_ui('返回 Esc')} >", mouse_handler("cancel")),
             ]
         )
 
@@ -9275,6 +9357,7 @@ def _split_dialog_title_body(text: str) -> tuple[str, str]:
 
 
 def _scrollable_text_dialog(title: str, text: str, ok_label: str = "确认 Enter") -> None:
+    title, text, ok_label = _ui(title), _ui(text), _ui(ok_label)
     text_area = TextArea(
         text=str(text or ""),
         read_only=True,
@@ -9290,7 +9373,7 @@ def _scrollable_text_dialog(title: str, text: str, ok_label: str = "确认 Enter
         title=HTML(f"<b><ansicyan>{title}</ansicyan></b>"),
         body=HSplit(
             [
-                Frame(text_area, title=HTML("<ansicyan>内容</ansicyan>")),
+                Frame(text_area, title=HTML(f"<ansicyan>{_ui('内容')}</ansicyan>")),
                 Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
             ],
             padding=1,
@@ -9333,6 +9416,7 @@ def _int_input(
 
 
 def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> bool | None:
+    title = _ui(title)
     if _use_line_dialogs():
         return _line_yes_no(title, default)
 
@@ -9353,15 +9437,15 @@ def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> b
         return handle
 
     def render_buttons():
-        yes_label = "< 是 Enter >" if default else "< 是 Y >"
-        no_label = "< 否 N >" if default else "< 否 Enter >"
+        yes_label = f"< {_ui('是')} Enter >" if default else f"< {_ui('是')} Y >"
+        no_label = f"< {_ui('否')} N >" if default else f"< {_ui('否')} Enter >"
         return FormattedText(
             [
                 ("class:menu.border", yes_label, mouse_handler(True)),
                 ("class:dialog.body", " "),
                 ("class:menu.border", no_label, mouse_handler(False)),
                 ("class:dialog.body", " "),
-                ("class:menu.border", "< 返回 Esc >", mouse_handler(None)),
+                ("class:menu.border", f"< {_ui('返回 Esc')} >", mouse_handler(None)),
             ]
         )
 
@@ -9377,13 +9461,13 @@ def _yes_no(title: str, default: bool, cancel_returns_default: bool = True) -> b
             focusable=True,
             style="class:input",
         )
-        body_items.append(Frame(body_area, title=HTML("<ansicyan>确认内容</ansicyan>")))
+        body_items.append(Frame(body_area, title=HTML(f"<ansicyan>{_ui('确认内容')}</ansicyan>")))
         focused = body_area
     else:
         focused = None
     body_items.extend(
         [
-            Label(text=f"默认: {'是' if default else '否'}"),
+            Label(text=f"{_ui('默认')}: {_ui('是' if default else '否')}"),
             Window(content=button_control, always_hide_cursor=True, height=1, dont_extend_height=True, align=WindowAlign.CENTER),
         ]
     )
@@ -9436,10 +9520,11 @@ def _confirm_yes(title: str, default: bool = True) -> bool:
 
 
 def _message(title: str, text: str) -> None:
+    title, text = _ui(title), _ui(text)
     if _use_line_dialogs():
         _line_message(title, text)
         return
-    _scrollable_text_dialog(title, text, ok_label="确认 Enter")
+    _scrollable_text_dialog(title, text, ok_label=_ui("确认 Enter"))
 
 
 def _show_recent_output(state: TuiState) -> None:
@@ -9454,7 +9539,7 @@ def _capture_output(state: TuiState, render: Callable[[Console], None], title: s
     if not output:
         output = "(无输出)"
     state.output_log = output
-    _message(title, _truncate_output(output))
+    _message(title, _truncate_output(_ui(output)))
     return output
 
 
@@ -9466,19 +9551,19 @@ def _truncate_output(output: str, limit: int = 12000) -> str:
 
 def _pause_dialog() -> None:
     if _use_line_dialogs():
-        input("按 Enter 继续...")
+        input(_ui("按 Enter 继续..."))
         return
     button_dialog(
-        title=HTML("<b><ansicyan>继续</ansicyan></b>"),
+        title=HTML(f"<b><ansicyan>{_ui('继续')}</ansicyan></b>"),
         text=_dialog_text("查看上方输出后继续", include_multiselect=False),
-        buttons=[("继续 Enter", True)],
+        buttons=[(_ui("继续 Enter"), True)],
         style=STYLE,
     ).run()
 
 
 def _dialog_text(text: str, include_multiselect: bool) -> HTML:
-    hint = "Space 勾选" if include_multiselect else ""
-    escaped = _escape_html(text)
+    hint = _ui("Space 勾选") if include_multiselect else ""
+    escaped = _escape_html(_ui(text))
     if hint:
         return HTML(f"{escaped}\n\n<ansiyellow>{hint}</ansiyellow>")
     return HTML(escaped)
@@ -9511,22 +9596,22 @@ def _line_menu(title: str, text: str, values: list[tuple[str, str]]) -> str | No
     table.add_column("Option")
     for index, (_value, label) in enumerate(values, start=1):
         table.add_row(str(index), str(label))
-    table.add_row("0", "返回/取消")
+    table.add_row("0", _ui("返回/取消"))
     console.print(table)
     if text:
         console.print(f"[dim]{text}[/dim]")
     while True:
-        raw = input("选择编号后按 Enter: ").strip()
+        raw = input(f"{_ui('选择编号后按 Enter')}: ").strip()
         if raw in {"", "0", "q", "Q"}:
             return None
         try:
             index = int(raw)
         except ValueError:
-            console.print("[red]请输入编号。[/red]")
+            console.print(f"[red]{_ui('请输入编号。')}[/red]")
             continue
         if 1 <= index <= len(values):
             return values[index - 1][0]
-        console.print("[red]编号超出范围。[/red]")
+        console.print(f"[red]{_ui('编号超出范围。')}[/red]")
 
 
 def _menu_dialog_width(text: str, values: list[tuple[str, str]]) -> int:
@@ -9549,7 +9634,25 @@ def _split_menu_text(text: str) -> tuple[str, str]:
     lines = [line for line in raw.splitlines() if line.strip()]
     if not lines:
         return "", ""
-    status_markers = ("[", "登录:", "任务:", "配置:", "目录:", "文件:", "project_id:", "asset_root:", "execution_mode:", "samples:")
+    status_markers = (
+        "[",
+        "登录:",
+        "任务:",
+        "配置:",
+        "目录:",
+        "文件:",
+        "界面语言:",
+        "Login:",
+        "Task:",
+        "Config:",
+        "Directory:",
+        "File:",
+        "Interface language:",
+        "project_id:",
+        "asset_root:",
+        "execution_mode:",
+        "samples:",
+    )
     if any(line.strip().startswith(status_markers) for line in lines) or len(lines) >= 3:
         return raw, ""
     return "", raw
@@ -9559,41 +9662,41 @@ def _menu_item_hint(label: object, fallback: str = "") -> str:
     text = str(label)
     head = text.split("  ", 1)[0].strip()
     hints = {
-        "环境检查 doctor": "检查本机环境、Docker 与常用工具。",
-        "用户与任务管理": "管理登录状态、任务和任务目录。",
-        "基础配置": "配置项目、执行环境、样本和参考文件。",
-        "Workflow": "按任务完成清单、参数、检查和运行。",
-        "Reference": "管理参考基因组、注释和 HISAT2 索引。",
-        "一条龙下载 FASTA+GTF 并构建 index": "从 Ensembl 或 URL 获取 FASTA/GTF，并生成 HISAT2 index，适合新物种或新版本。",
-        "浏览 reference": "查看我的资产或公共资产。列表只显示名称，进入后查看来源、物种、索引和检查结果。",
-        "登记本地 FASTA/GTF": "把已有本地 FASTA、GTF/GFF 或 HISAT2 index 登记为可复用资产，可复制入库。",
-        "构建 HISAT2 index": "对已登记的 FASTA 运行 hisat2-build，生成后续比对使用的 index prefix。",
-        "检查 reference 资产": "检查 FASTA、注释文件和 HISAT2 index 是否存在且非空，并清理失效记录。",
-        "写入当前 config": "把选中的 reference 路径写入传统 config.yaml，主要用于旧 CLI/调试流程。",
-        "清理失效 reference 记录": "移除文件已丢失或索引不完整的 reference 记录，避免列表显示不可用资产。",
-        "工具调试": "单独运行某一步，用于排查问题。",
-        "查看最近输出": "查看上一次命令或检查结果。",
-        "退出": "关闭终端工作台。",
-        "登录/注册用户": "进入账号登录或注册。",
-        "任务管理": "创建、选择、编辑或删除任务。",
-        "创建新任务": "建立新的任务目录和记录。",
-        "选择已有任务": "切换当前任务。",
-        "修改当前任务名称/描述": "只修改显示信息，不移动目录。",
-        "删除当前任务": "删除当前任务目录和数据库记录。",
-        "进入 Workflow 向导": "继续完成当前任务的流程配置。",
-        "提交清单": "保存待下载的数据清单。",
-        "工具配置": "设置本任务使用的工具参数。",
-        "资源检查": "检查磁盘、工具和参考资产。",
-        "正式运行": "开始执行当前任务。",
-        "按样本流水线": "样本完成一步后立即进入下一步，适合正式运行。",
-        "按阶段批量": "所有样本完成当前步骤后，再进入下一步骤，适合排错。",
-        "Docker": "使用容器中的工具，环境更一致。",
-        "Local": "使用本机已安装的工具。",
-        "任务完成后清理": "任务成功后清理大体积中间文件。",
-        "每步成功后清理": "每一步成功后清理上一步大体积文件。",
-        "不自动清理": "保留全部产物，便于复查。",
+        "环境检查 doctor": "确认环境已就绪。",
+        "用户与任务管理": "管理账号和任务。",
+        "基础配置": "设置项目基础信息。",
+        "Workflow": "按步骤完成分析。",
+        "Reference": "管理可复用参考。",
+        "一条龙下载 FASTA+GTF 并构建 index": "准备新的参考资产。",
+        "浏览 reference": "查看可用参考。",
+        "登记本地 FASTA/GTF": "添加已有参考文件。",
+        "构建 HISAT2 index": "为参考构建索引。",
+        "检查 reference 资产": "确认参考完整可用。",
+        "写入当前 config": "应用到当前配置。",
+        "清理失效 reference 记录": "移除不可用记录。",
+        "工具调试": "单步运行工具。",
+        "查看最近输出": "查看上一条结果。",
+        "退出": "关闭工作台。",
+        "登录/注册用户": "进入账号。",
+        "任务管理": "创建或选择任务。",
+        "创建新任务": "开始一个新任务。",
+        "选择已有任务": "继续已有任务。",
+        "修改当前任务名称/描述": "更新任务信息。",
+        "删除当前任务": "删除此任务。",
+        "进入 Workflow 向导": "继续配置流程。",
+        "提交清单": "添加样本清单。",
+        "工具配置": "调整运行参数。",
+        "资源检查": "确认资源足够。",
+        "正式运行": "开始运行。",
+        "按样本流水线": "样本完成后继续下一步。",
+        "按阶段批量": "每个阶段批量完成。",
+        "Docker": "使用容器环境。",
+        "Local": "使用本机工具。",
+        "任务完成后清理": "结束后清理大文件。",
+        "每步成功后清理": "边运行边清理。",
+        "不自动清理": "保留所有产物。",
     }
-    return hints.get(head, _short_hint(fallback or head or text, limit=86))
+    return _ui(hints.get(head, _short_hint(fallback or head or text, limit=58)))
 
 
 def _wrap_display_text(text: str, width: int) -> list[str]:
@@ -9670,18 +9773,18 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
             start_line = status_scroll["line"]
             end_line = min(len(status_lines), start_line + visible_status_lines)
             if start_line:
-                fragments.append(("class:dialog.body", f"... 上方还有 {start_line} 行\n"))
+                fragments.append(("class:dialog.body", _ui(f"... 上方还有 {start_line} 行") + "\n"))
             for line in status_lines[start_line:end_line]:
                 wrapped = _wrap_display_text(line, max(24, dialog_width - 10)) or [""]
                 for wrapped_line in wrapped:
                     fragments.append(("class:dialog.body", wrapped_line + "\n"))
             if end_line < len(status_lines):
-                fragments.append(("class:dialog.body", f"... 下方还有 {len(status_lines) - end_line} 行\n"))
+                fragments.append(("class:dialog.body", _ui(f"... 下方还有 {len(status_lines) - end_line} 行") + "\n"))
             fragments.append(("", "\n"))
         start = _scroll_window_start(len(values), selected["index"], visible_options)
         end = min(len(values), start + visible_options)
         if start:
-            fragments.append(("class:dialog.body", f"   ... 上方还有 {start} 项\n"))
+            fragments.append(("class:dialog.body", "   " + _ui(f"... 上方还有 {start} 项") + "\n"))
         for index in range(start, end):
             _value, label = values[index]
             active = index == selected["index"]
@@ -9703,9 +9806,9 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
             else:
                 fragments.append(("class:menu", f"{indent}   {label_text}\n", handle_click))
         if end < len(values):
-            fragments.append(("class:dialog.body", f"   ... 下方还有 {len(values) - end} 项\n"))
+            fragments.append(("class:dialog.body", "   " + _ui(f"... 下方还有 {len(values) - end} 项") + "\n"))
         fragments.append(("", "\n"))
-        fragments.append(("class:menu.border", "说明: "))
+        fragments.append(("class:menu.border", f"{_ui('说明')}: "))
         hint_lines = _wrap_display_text(
             _menu_item_hint(values[selected["index"]][1] if values else "", fallback=fallback_hint),
             max(20, dialog_width - 14),
@@ -9715,7 +9818,7 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
             fragments.append(("", "\n"))
             fragments.append(("class:dialog.body", "      " + line))
         fragments.append(("", "\n"))
-        fragments.append(("class:dialog.body", "      Enter 进入，PgUp/PgDn 翻选项，Ctrl+U/Ctrl+D 翻状态文本。"))
+        fragments.append(("class:dialog.body", "      " + _ui("Enter 打开，Esc 返回。")))
         return FormattedText(fragments)
 
     control = FormattedTextControl(render_menu, focusable=True)
@@ -9794,9 +9897,9 @@ def _keyboard_menu(title: str, text: str, values: list[tuple[str, str]]) -> str 
     def render_buttons():
         return FormattedText(
             [
-                ("class:menu.border", "< 进入 Enter >", button_mouse_handler("accept")),
+                ("class:menu.border", f"< {_ui('进入 Enter')} >", button_mouse_handler("accept")),
                 ("class:dialog.body", " "),
-                ("class:menu.border", "< 返回 Esc >", button_mouse_handler("cancel")),
+                ("class:menu.border", f"< {_ui('返回 Esc')} >", button_mouse_handler("cancel")),
             ]
         )
 
@@ -9871,9 +9974,9 @@ def _line_multiline_input(title: str, text: str, default: str = "") -> str | Non
     if text:
         console.print(f"[dim]{text}[/dim]")
     if default:
-        console.print("[dim]默认内容如下，直接输入空行会使用默认内容。[/dim]")
+        console.print(f"[dim]{_ui('默认内容如下，直接输入空行会使用默认内容。')}[/dim]")
         console.print(default)
-    console.print("[yellow]粘贴多行后，单独输入一行 END 结束；输入 CANCEL 取消。[/yellow]")
+    console.print(f"[yellow]{_ui('粘贴多行后，单独输入一行 END 结束；输入 CANCEL 取消。')}[/yellow]")
     lines: list[str] = []
     while True:
         raw = input()
@@ -9900,7 +10003,7 @@ def _line_message(title: str, text: str) -> None:
     console = Console()
     console.print(f"[cyan]{title}[/cyan]")
     console.print(text)
-    input("按 Enter 继续...")
+    input(_ui("按 Enter 继续..."))
 
 
 def _line_multiselect(
@@ -9918,9 +10021,9 @@ def _line_multiselect(
     for index, (value, label) in enumerate(values, start=1):
         table.add_row(str(index), "*" if value in defaults else "", str(label))
     console.print(table)
-    console.print("[yellow]输入编号，用逗号/空格分隔；直接 Enter 使用默认全选；0/q 返回。[/yellow]")
+    console.print(f"[yellow]{_ui('输入编号，用逗号/空格分隔；直接 Enter 使用默认全选；0/q 返回。')}[/yellow]")
     while True:
-        raw = input("选择: ").strip()
+        raw = input(_ui("选择:")).strip()
         if raw.lower() in {"0", "q", "cancel"}:
             return None
         if not raw:
@@ -9934,7 +10037,7 @@ def _line_multiselect(
                     raise ValueError
                 selected.append(values[index - 1][0])
         except ValueError:
-            console.print("[red]请输入有效编号。[/red]")
+            console.print(f"[red]{_ui('请输入有效编号。')}[/red]")
             continue
         return selected
 

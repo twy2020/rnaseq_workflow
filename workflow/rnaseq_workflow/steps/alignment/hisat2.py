@@ -37,6 +37,41 @@ def build_hisat2_command(
     return command
 
 
+def build_hisat2_sort_command(
+    fastq_paths: list[str | Path],
+    index_prefix: str | Path,
+    bam_output: str | Path,
+    log_output: str | Path,
+    options: Hisat2Options | None = None,
+    samtools_threads: int = 2,
+    index_bam: bool = True,
+) -> list[str]:
+    opts = options or Hisat2Options(index_prefix=Path(index_prefix))
+    if len(fastq_paths) == 1:
+        read_args = ' -U "$3"'
+        args: list[str | Path] = [opts.threads, index_prefix, fastq_paths[0], log_output, samtools_threads, bam_output]
+        splice_offset = 7
+    elif len(fastq_paths) == 2:
+        read_args = ' -1 "$3" -2 "$4"'
+        args = [opts.threads, index_prefix, fastq_paths[0], fastq_paths[1], log_output, samtools_threads, bam_output]
+        splice_offset = 8
+    else:
+        raise ValueError("HISAT2 requires one FASTQ for single-end or two FASTQ files for paired-end")
+    splice_arg = ""
+    if opts.known_splicesite_infile:
+        splice_arg = f' --known-splicesite-infile "${splice_offset}"'
+        args.append(opts.known_splicesite_infile)
+    log_arg = "$4" if len(fastq_paths) == 1 else "$5"
+    sort_threads_arg = "$5" if len(fastq_paths) == 1 else "$6"
+    bam_arg = "$6" if len(fastq_paths) == 1 else "$7"
+    index_command = f' && samtools index "{bam_arg}"' if index_bam else ""
+    script = (
+        f'set -o pipefail; hisat2 -p "$1" -x "$2"{read_args}{splice_arg} '
+        f'--summary-file "{log_arg}" | samtools sort -@ "{sort_threads_arg}" -o "{bam_arg}" -{index_command}'
+    )
+    return ["bash", "-lc", script, "rnaseq-hisat2-sort", *[str(arg) for arg in args]]
+
+
 def hisat2_index_exists(index_prefix: str | Path) -> bool:
     prefix = Path(index_prefix)
     parent = prefix.parent if str(prefix.parent) else Path(".")
@@ -72,6 +107,8 @@ class Hisat2AlignStep:
         output_dir = project_paths(context.output_dir).alignment_dir(sample)
         output_dir.mkdir(parents=True, exist_ok=True)
         sam_output = output_dir / f"{sample.sample_id}.sam"
+        bam_output = output_dir / f"{sample.sample_id}.sorted.bam"
+        index_output = Path(str(bam_output) + ".bai")
         log_output = output_dir / f"{sample.sample_id}.hisat2.log"
         fastq_paths = _fastq_paths(sample)
         index_prefix = Path(context.config["hisat2_index"])
@@ -82,10 +119,23 @@ class Hisat2AlignStep:
             if context.config.get("hisat2_splicesites")
             else None,
         )
-        command = build_hisat2_command(fastq_paths, index_prefix, sam_output, log_output, options)
+        direct_sort = bool(context.config.get("hisat2_sort_bam", False))
+        if direct_sort:
+            command = build_hisat2_sort_command(
+                fastq_paths,
+                index_prefix,
+                bam_output,
+                log_output,
+                options,
+                samtools_threads=int(context.config.get("samtools_threads", 2)),
+                index_bam=bool(context.config.get("samtools_index", True)),
+            )
+        else:
+            command = build_hisat2_command(fastq_paths, index_prefix, sam_output, log_output, options)
         result = run_context_command(command, context)
         status = StepStatus.COMPLETED if result.ok else StepStatus.FAILED
-        message = "hisat2 completed" if result.ok else result.stderr
+        message = "hisat2 completed with direct BAM sorting" if result.ok and direct_sort else "hisat2 completed" if result.ok else result.stderr
+        outputs = [bam_output, log_output, index_output] if direct_sort else [sam_output, log_output]
         return StepResult(
             sample_id=sample.sample_id,
             step_id=self.step_id,
@@ -94,12 +144,13 @@ class Hisat2AlignStep:
             command=result.command,
             return_code=result.return_code,
             inputs=fastq_paths,
-            outputs=[sam_output, log_output],
+            outputs=outputs,
             extra={
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "duration_seconds": result.duration_seconds,
                 "dry_run": result.dry_run,
+                "direct_bam_sort": direct_sort,
             },
         )
 

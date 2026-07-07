@@ -366,7 +366,15 @@ def _run_workflow_menu(console: Console, state: dict) -> None:
     print_run_summary(console, cfg.output_dir / "progress.json")
     if _confirm(console, "生成最终 counts matrix 和报告", False):
         try:
-            print_finalize_result(console, finalize_project(cfg.project_id, cfg.output_dir, samples))
+            print_finalize_result(
+                console,
+                finalize_project(
+                    cfg.project_id,
+                    cfg.output_dir,
+                    samples,
+                    output_formats=cfg.settings.get("expression_output_formats"),
+                ),
+            )
         except FileNotFoundError as exc:
             print_error(console, str(exc))
 
