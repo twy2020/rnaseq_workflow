@@ -159,7 +159,3 @@ pytest
 pytest test/cli
 pytest test/alignment
 ```
-
-## 数据与版本控制
-
-本仓库只保存程序本体、配置示例、模板和轻量文档。真实测序数据、运行输出、论文初稿、benchmark 产物和本地 workspace 已通过 `.gitignore` 排除，不应提交到 Git。
