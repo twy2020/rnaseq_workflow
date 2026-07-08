@@ -28,6 +28,25 @@ def test_translate_menu_values_to_english() -> None:
     assert translate("选择你想使用的语言。") == "Choose your preferred language."
 
 
+def test_translate_common_tui_errors_to_english() -> None:
+    set_language("en")
+
+    assert translate("注册失败") == "Registration failed"
+    assert translate("密码不能为空。") == "Password cannot be empty."
+    assert translate("请先选择任务。") == "Select a task first."
+    assert translate("D:\\data 下没有可用于 HISAT2 的 FASTQ 文件。") == "No FASTQ files for HISAT2 were found under D:\\data."
+
+
+def test_translate_resource_guidance_to_english() -> None:
+    set_language("en")
+
+    assert translate("网络连通。") == "Network reachable."
+    assert translate("磁盘空间满足当前估算。") == "Disk space satisfies the current estimate."
+    assert translate("请重建镜像：docker build -f docker/Dockerfile.tools -t rnaseq-workflow:tools .") == (
+        "Please rebuild the image: docker build -f docker/Dockerfile.tools -t rnaseq-workflow:tools ."
+    )
+
+
 def test_chinese_mode_keeps_source_text() -> None:
     set_language("zh")
 
