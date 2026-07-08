@@ -72,16 +72,16 @@ rnaseq tui
 rnaseq init-config config.yaml --overwrite
 ```
 
-校验配置：
+编辑 `config.yaml`，把样本 FASTQ/SRA、参考基因组、GTF/GFF 和 HISAT2 index 路径替换为真实文件后，再校验配置：
 
 ```powershell
 rnaseq validate-config config.yaml
 ```
 
-运行工作流：
+真实运行工作流：
 
 ```powershell
-rnaseq run config.yaml --max-workers 2 --finalize
+rnaseq run config.yaml --no-dry-run --max-workers 2 --finalize
 ```
 
 常用输出格式可在配置中设置，例如期刊分析推荐：
@@ -108,7 +108,7 @@ rnaseq reference-register tair10 `
 构建 HISAT2 index：
 
 ```powershell
-rnaseq reference-build-hisat2 tair10 --threads 8 --dry-run false
+rnaseq reference-build-hisat2 tair10 --threads 8 --no-dry-run
 ```
 
 查看和检查参考资产：
